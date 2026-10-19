@@ -81,7 +81,7 @@ Verification commands: `pnpm test`, `pnpm build`.
 
 ## Phase 4: Ship
 
-- [ ] **T10: Dockerfile + GHCR workflow**
+- [x] **T10: Dockerfile + GHCR workflow**
   - Acceptance: A multi-stage image (vite build, then `node:24-slim`) that runs as uid 100000 and works with a read-only root filesystem (temp files on `/data` or emptyDir). The GH Action builds and pushes `ghcr.io/<you>/mangarr` on tags and main.
   - Verify: `docker build . && docker run --read-only -u 100000 ...` serves `/api/health`. The workflow run is green.
   - Files: `Dockerfile`, `.dockerignore`, `.github/workflows/image.yaml`
