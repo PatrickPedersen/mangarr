@@ -1,0 +1,175 @@
+import { existsSync, mkdirSync, renameSync } from 'node:fs'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import type { DatabaseSync } from 'node:sqlite'
+import { Hono } from 'hono'
+import * as suwayomi from './suwayomi.ts'
+import { cbzName } from './cbz.ts'
+import { enqueue } from './worker.ts'
+
+const id = (s: string | undefined) => (s && /^\d+$/.test(s) ? Number(s) : null)
+
+export function api(db: DatabaseSync, libraryDir: string, sw: typeof suwayomi = suwayomi) {
+  const app = new Hono()
+
+  app.onError((e, c) => c.json({ error: e.message }, 502))
+
+  app.get('/sources', async c => c.json(await sw.sources()))
+
+  app.get('/search', async c => {
+    const source = c.req.query('source')
+    const q = c.req.query('q')?.trim()
+    if (!source || !/^\d+$/.test(source) || !q) return c.json({ error: 'source and q are required' }, 400)
+    return c.json(await sw.search(source, q))
+  })
+
+  // Suwayomi isn't reachable from the browser, so covers go through here.
+  app.get('/cover/:mangaId', async c => {
+    const mangaId = id(c.req.param('mangaId'))
+    if (mangaId === null) return c.json({ error: 'bad id' }, 400)
+    const { data, ext } = await sw.image(`/api/v1/manga/${mangaId}/thumbnail`)
+    return c.body(data as Uint8Array<ArrayBuffer>, 200, { 'content-type': `image/${ext === 'jpg' ? 'jpeg' : ext}`, 'cache-control': 'max-age=86400' })
+  })
+
+  app.get('/series', c =>
+    c.json(
+      db
+        .prepare(
+          `select s.id, s.title, s.suwayomi_manga_id, s.source_name, s.status, s.last_checked_at, s.last_error,
+                  count(c.id) as chapter_count, max(c.number) as latest_chapter,
+                  (select state from jobs j where j.series_id = s.id order by j.id desc limit 1) as job_state
+           from series s left join chapters c on c.series_id = s.id and c.removed = 0
+           group by s.id order by s.title collate nocase`,
+        )
+        .all(),
+    ),
+  )
+
+  app.get('/jobs', c =>
+    c.json(
+      db
+        .prepare(
+          `select j.id, j.series_id, s.title, j.kind, j.state, j.error, j.created_at, j.finished_at
+           from jobs j join series s on s.id = j.series_id order by j.id desc limit 200`,
+        )
+        .all(),
+    ),
+  )
+
+  app.get('/series/:id', c => {
+    const seriesId = id(c.req.param('id'))
+    const series = seriesId === null ? undefined : db.prepare(`select * from series where id = ?`).get(seriesId)
+    if (!series) return c.json({ error: 'not found' }, 404)
+    const chapters = db.prepare(`select number, title, downloaded_at, removed, warning from chapters where series_id = ? order by number desc`).all(seriesId)
+    const jobs = db.prepare(`select id, kind, state, error, created_at, finished_at from jobs where series_id = ? order by id desc limit 10`).all(seriesId)
+    return c.json({ ...series, chapters, jobs })
+  })
+
+  app.post('/series/:id/check', c => {
+    const seriesId = id(c.req.param('id'))
+    if (seriesId === null || !db.prepare(`select 1 from series where id = ?`).get(seriesId)) return c.json({ error: 'not found' }, 404)
+    enqueue(db, seriesId, 'check')
+    return c.json({ queued: true }, 202)
+  })
+
+  // Point a series at the same title on another source. Chapters already in the CBZ stay; only
+  // numbers above the current max come from the new source (see resume_after in the worker).
+  app.post('/series/:id/source', async c => {
+    const seriesId = id(c.req.param('id'))
+    const series = seriesId === null ? undefined : (db.prepare(`select id, suwayomi_manga_id from series where id = ?`).get(seriesId) as { id: number; suwayomi_manga_id: number } | undefined)
+    if (!series) return c.json({ error: 'not found' }, 404)
+    const body = await c.req.json().catch(() => ({}))
+    const mangaId = typeof body.mangaId === 'number' && Number.isInteger(body.mangaId) ? body.mangaId : null
+    if (mangaId === null) return c.json({ error: 'mangaId (integer) is required' }, 400)
+    if (mangaId === series.suwayomi_manga_id) return c.json({ error: 'that is already the current source' }, 400)
+    if (db.prepare(`select 1 from jobs where series_id = ? and state = 'running'`).get(series.id)) return c.json({ error: 'a download is running; try again when it finishes' }, 409)
+    const { manga } = await sw.manga(mangaId)
+    db.prepare(
+      `update series set suwayomi_manga_id = ?, source_name = ?, cover_url = ?, last_error = null,
+         resume_after = (select max(number) from chapters where series_id = ?) where id = ?`,
+    ).run(manga.id, manga.source.displayName, manga.thumbnailUrl, series.id, series.id)
+    enqueue(db, series.id, 'check')
+    return c.json({ sourceName: manga.source.displayName })
+  })
+
+  // Removal is applied by the worker (the only CBZ writer) on the job queued here.
+  app.post('/series/:id/chapters/:number/remove', c => {
+    const seriesId = id(c.req.param('id'))
+    const number = Number(c.req.param('number'))
+    if (seriesId === null || !Number.isFinite(number)) return c.json({ error: 'bad id or chapter number' }, 400)
+    const res = db.prepare(`update chapters set removed = 1 where series_id = ? and number = ?`).run(seriesId, number)
+    if (!res.changes) return c.json({ error: 'not found' }, 404)
+    enqueue(db, seriesId, 'check')
+    return c.json({ queued: true }, 202)
+  })
+
+  app.post('/series/:id/chapters/:number/restore', c => {
+    const seriesId = id(c.req.param('id'))
+    const number = Number(c.req.param('number'))
+    if (seriesId === null || !Number.isFinite(number)) return c.json({ error: 'bad id or chapter number' }, 400)
+    const series = db.prepare(`select resume_after from series where id = ?`).get(seriesId) as { resume_after: number | null } | undefined
+    if (!series) return c.json({ error: 'not found' }, 404)
+    // Below the switch point the current source isn't asked for old chapters, so deleting the row wouldn't bring it back.
+    if (series.resume_after !== null && number <= series.resume_after) {
+      return c.json({ error: 'this chapter is from before the source switch; Redownload all brings it back' }, 409)
+    }
+    const res = db.prepare(`delete from chapters where series_id = ? and number = ? and removed = 1`).run(seriesId, number)
+    if (!res.changes) return c.json({ error: 'not a removed chapter' }, 404)
+    enqueue(db, seriesId, 'check')
+    return c.json({ queued: true }, 202)
+  })
+
+  app.post('/series/:id/rebuild', c => {
+    const seriesId = id(c.req.param('id'))
+    if (seriesId === null || !db.prepare(`select 1 from series where id = ?`).get(seriesId)) return c.json({ error: 'not found' }, 404)
+    enqueue(db, seriesId, 'rebuild')
+    return c.json({ queued: true }, 202)
+  })
+
+  // For when the CBZ lives somewhere else, e.g. BookOrbit organised it into manhwa/<author>/<series>/.
+  // Existing file at the new path → adopt it. Otherwise move ours there.
+  app.patch('/series/:id', async c => {
+    const seriesId = id(c.req.param('id'))
+    const series = seriesId === null ? undefined : (db.prepare(`select id, file_path from series where id = ?`).get(seriesId) as { id: number; file_path: string } | undefined)
+    if (!series) return c.json({ error: 'not found' }, 404)
+    const body = await c.req.json().catch(() => ({}))
+    if (typeof body.filePath !== 'string' || !body.filePath.trim()) return c.json({ error: 'filePath is required' }, 400)
+    // Relative paths are relative to the library; either way it has to stay inside it.
+    const next = resolve(libraryDir, body.filePath.trim())
+    const rel = relative(resolve(libraryDir), next)
+    if (!rel || rel.startsWith('..') || isAbsolute(rel) || rel.split(/[\\/]/).some(p => p.startsWith('.'))) {
+      return c.json({ error: `path must be inside ${libraryDir} and not in a hidden folder` }, 400)
+    }
+    if (!next.toLowerCase().endsWith('.cbz')) return c.json({ error: 'path must end in .cbz' }, 400)
+    if (next === resolve(series.file_path)) return c.json({ filePath: series.file_path })
+    if (db.prepare(`select 1 from series where file_path = ? and id != ?`).get(next, series.id)) return c.json({ error: 'another series already uses that file' }, 409)
+    if (db.prepare(`select 1 from jobs where series_id = ? and state = 'running'`).get(series.id)) return c.json({ error: 'a download is running; try again when it finishes' }, 409)
+
+    let moved = false
+    if (!existsSync(next) && existsSync(series.file_path)) {
+      mkdirSync(dirname(next), { recursive: true })
+      renameSync(series.file_path, next)
+      moved = true
+    }
+    db.prepare(`update series set file_path = ?, last_error = null where id = ?`).run(next, series.id)
+    return c.json({ filePath: next, moved })
+  })
+
+  app.post('/series', async c => {
+    const body = await c.req.json().catch(() => ({}))
+    const mangaId = typeof body.mangaId === 'number' && Number.isInteger(body.mangaId) ? body.mangaId : null
+    if (mangaId === null) return c.json({ error: 'mangaId (integer) is required' }, 400)
+    const { manga } = await sw.manga(mangaId)
+    const filePath = join(libraryDir, cbzName(manga.title))
+    const taken = db.prepare(`select id from series where file_path = ?`).get(filePath)
+    if (taken) return c.json({ error: `"${manga.title}" is already tracked` }, 409)
+    // Never adopt a CBZ we didn't create: appending would mix our chapters into someone else's file.
+    if (existsSync(filePath)) return c.json({ error: `${cbzName(manga.title)} already exists in the library` }, 409)
+    const { lastInsertRowid } = db
+      .prepare(`insert into series (title, suwayomi_manga_id, source_name, cover_url, file_path) values (?, ?, ?, ?, ?)`)
+      .run(manga.title, manga.id, manga.source.displayName, manga.thumbnailUrl, filePath)
+    enqueue(db, Number(lastInsertRowid), 'download')
+    return c.json({ id: Number(lastInsertRowid), title: manga.title }, 201)
+  })
+
+  return app
+}

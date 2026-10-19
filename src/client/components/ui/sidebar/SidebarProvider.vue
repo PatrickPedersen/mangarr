@@ -1,0 +1,93 @@
+<script setup lang="ts">
+import type { HTMLAttributes, Ref } from 'vue'
+import { useEventListener, useMediaQuery, useVModel } from '@vueuse/core'
+import { TooltipProvider } from 'reka-ui'
+import { computed, ref } from 'vue'
+import { cn } from '@/lib/utils'
+import { useSidebarPrefs } from '@/composables/useSidebarPrefs'
+import { provideSidebarContext, SIDEBAR_KEYBOARD_SHORTCUT, SIDEBAR_WIDTH_ICON } from './utils'
+import { useSidebarWidth } from './useSidebarWidth'
+
+const { readDeviceValue, writeDeviceValue } = useSidebarPrefs()
+
+const props = withDefaults(
+  defineProps<{
+    defaultOpen?: boolean
+    open?: boolean
+    class?: HTMLAttributes['class']
+  }>(),
+  {
+    defaultOpen: undefined,
+    open: undefined,
+  },
+)
+
+const emits = defineEmits<{
+  'update:open': [open: boolean]
+}>()
+
+const isMobile = useMediaQuery('(max-width: 768px)')
+const openMobile = ref(false)
+
+const open = useVModel(props, 'open', emits, {
+  defaultValue: props.defaultOpen ?? !readDeviceValue<boolean>('collapsed', false),
+  passive: (props.open === undefined) as false,
+}) as Ref<boolean>
+
+function setOpen(value: boolean) {
+  open.value = value // emits('update:open', value)
+  writeDeviceValue('collapsed', !open.value)
+}
+
+function setOpenMobile(value: boolean) {
+  openMobile.value = value
+}
+
+// Helper to toggle the sidebar.
+function toggleSidebar() {
+  return isMobile.value ? setOpenMobile(!openMobile.value) : setOpen(!open.value)
+}
+
+useEventListener('keydown', (event: KeyboardEvent) => {
+  if (event.key === SIDEBAR_KEYBOARD_SHORTCUT && (event.metaKey || event.ctrlKey)) {
+    event.preventDefault()
+    toggleSidebar()
+  }
+})
+
+// We add a state so that we can do data-state="expanded" or "collapsed".
+// This makes it easier to style the sidebar with Tailwind classes.
+const state = computed(() => (open.value ? 'expanded' : 'collapsed'))
+const { widthPx, setWidth, minWidthPx, maxWidthPx } = useSidebarWidth()
+const desktopSidebarWidth = computed(() => `${widthPx.value}px`)
+
+provideSidebarContext({
+  state,
+  open,
+  setOpen,
+  isMobile,
+  openMobile,
+  setOpenMobile,
+  toggleSidebar,
+  widthPx,
+  setWidth,
+  minWidthPx,
+  maxWidthPx,
+})
+</script>
+
+<template>
+  <div
+    data-slot="sidebar-wrapper"
+    :style="{
+      '--sidebar-width': desktopSidebarWidth,
+      '--sidebar-width-icon': SIDEBAR_WIDTH_ICON,
+    }"
+    :class="cn('group/sidebar-wrapper has-data-[variant=inset]:bg-sidebar flex min-h-svh w-full', props.class)"
+    v-bind="$attrs"
+  >
+    <TooltipProvider :delay-duration="0">
+      <slot />
+    </TooltipProvider>
+  </div>
+</template>

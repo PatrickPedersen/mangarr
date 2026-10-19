@@ -1,0 +1,21 @@
+<!doctype html>
+<!-- BookOrbit's default appearance, pinned: blue accent, "bookorbit" style, steel surface, glow 50, brightness 35, opacity 92. -->
+<html lang="en" class="accent-blue" data-style="bookorbit" data-surface="steel" data-glow="on"
+  style="--glow-reach: 0.5; --bg-lift: 0.0420; --shell-surface-opacity: 92%">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mangarr</title>
+    <script>
+      // Follow the OS theme, like BookOrbit's default "system" setting.
+      const q = matchMedia('(prefers-color-scheme: dark)')
+      const apply = () => document.documentElement.classList.toggle('dark', q.matches)
+      apply()
+      q.addEventListener('change', apply)
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
