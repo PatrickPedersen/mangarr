@@ -43,39 +43,55 @@ function listEntries(zip: yauzl.ZipFile) {
   })
 }
 
+/** Pages to copy from another CBZ: entries whose chapter dir passes `keep`. */
+export type Source = { path: string; keep: (chapterDir: string) => boolean }
+
 /**
  * Rewrites `target` as its existing pages + `add` and a fresh ComicInfo.xml, streaming entry by
  * entry (constant memory, zip64 past 4 GB). Built in a dot-directory beside it and renamed over it:
  * BookOrbit ignores dot paths and never sees a partial file, and a crash leaves the old CBZ intact.
  */
-export async function writeCbz(target: string, add: AddFile[], info: ComicInfo, { fresh = false, drop = new Set<string>() } = {}) {
-  // fresh: build from `add` only; the old file is still replaced atomically at the end.
-  // drop: chapter dirs (e.g. "0041.0") to leave out of the rewritten archive.
-  const old = !fresh && existsSync(target) ? await openZip(target) : undefined
+export async function writeCbz(target: string, add: AddFile[], info: ComicInfo, opts: BuildOptions = {}) {
+  const tmp = await buildCbz(target, add, info, opts)
   try {
-    const addNames = new Set(add.map(a => a.name))
-    const newCover = add.some(a => isCover(a.name))
-    const kept = old
-      ? (await listEntries(old)).filter(
-          e =>
-            (isPage(e.fileName) || isCover(e.fileName)) &&
-            !addNames.has(e.fileName) &&
-            !(newCover && isCover(e.fileName)) &&
-            !drop.has(e.fileName.split('/')[0]!),
-        )
-      : []
+    renameSync(tmp, target)
+  } finally {
+    cleanTmp(target)
+  }
+}
+
+type BuildOptions = { fresh?: boolean; drop?: Set<string>; from?: Source[] }
+
+/**
+ * The first half of writeCbz: builds the new archive and returns its temp path without touching
+ * `target`, so several volumes can be built before any is replaced. The caller renames it, then cleanTmp().
+ * fresh: don't start from `target`'s own entries. drop: chapter dirs (e.g. "0041.0") to leave out.
+ * from: other CBZs to copy pages from; the first cover found is kept if `add` has none.
+ */
+export async function buildCbz(target: string, add: AddFile[], info: ComicInfo, { fresh = false, drop = new Set<string>(), from = [] }: BuildOptions = {}) {
+  const sources: Source[] = [...(!fresh && existsSync(target) ? [{ path: target, keep: () => true }] : []), ...from]
+  const zips: yauzl.ZipFile[] = []
+  try {
+    const taken = new Set(add.map(a => a.name))
+    let hasCover = add.some(a => isCover(a.name))
     // pipe() doesn't forward input errors to yazl; without this a failing read (e.g. an NFS hiccup) hangs forever.
     let abort = (_e: Error) => {}
     const guard = (s: Readable) => s.on('error', e => abort(e))
     type Item = { name: string; size: number; open: () => Promise<Readable> }
-    const items: Item[] = [
-      ...kept.map(e => ({
-        name: e.fileName,
-        size: e.uncompressedSize,
-        open: () => new Promise<Readable>((ok, fail) => old!.openReadStream(e, (err, s) => (err ? fail(err) : ok(guard(s))))),
-      })),
-      ...add.map(a => ({ name: a.name, size: statSync(a.path).size, open: async () => guard(createReadStream(a.path)) })),
-    ].sort((a, b) => (a.name < b.name ? -1 : 1))
+    const items: Item[] = add.map(a => ({ name: a.name, size: statSync(a.path).size, open: async () => guard(createReadStream(a.path)) }))
+    for (const src of sources) {
+      const zip = await openZip(src.path)
+      zips.push(zip)
+      for (const e of await listEntries(zip)) {
+        const name = e.fileName
+        const ok = isCover(name) ? !hasCover : isPage(name) && !taken.has(name) && !drop.has(name.split('/')[0]!) && src.keep(name.split('/')[0]!)
+        if (!ok) continue
+        if (isCover(name)) hasCover = true
+        taken.add(name) // a chapter found in two sources (after an interrupted restructure) is copied once
+        items.push({ name, size: e.uncompressedSize, open: () => new Promise<Readable>((res, fail) => zip.openReadStream(e, (err, st) => (err ? fail(err) : res(guard(st))))) })
+      }
+    }
+    items.sort((a, b) => (a.name < b.name ? -1 : 1))
 
     const zip = new yazl.ZipFile()
     zip.addBuffer(Buffer.from(comicInfoXml(info, items.filter(i => isPage(i.name)).length)), 'ComicInfo.xml', { compress: false })
@@ -98,18 +114,22 @@ export async function writeCbz(target: string, add: AddFile[], info: ComicInfo, 
         zip.on('error', abort)
         pipeline(out, createWriteStream(tmp)).then(ok, fail)
       })
-      renameSync(tmp, target)
     } catch (e) {
-      rmSync(tmp, { force: true })
+      cleanTmp(target)
       throw e
-    } finally {
-      // Don't leave empty dot-dirs inside folders BookOrbit organises; fails harmlessly if staging lives here.
-      try { rmdirSync(tmpDir) } catch {}
     }
-    return items.filter(i => isPage(i.name)).length
+    return tmp
   } finally {
-    old?.close()
+    for (const z of zips) z.close()
   }
+}
+
+/** Removes target's temp file (if a build or rename failed) and the dot-dir once it's empty. */
+export function cleanTmp(target: string) {
+  const tmpDir = join(dirname(target), '.mangarr-tmp')
+  rmSync(join(tmpDir, basename(target)), { force: true })
+  // Don't leave empty dot-dirs inside folders BookOrbit organises; fails harmlessly while other temp files remain.
+  try { rmdirSync(tmpDir) } catch {}
 }
 
 /** Entry names currently in a CBZ (used to verify and in tests). */

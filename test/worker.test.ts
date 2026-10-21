@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import yauzl from 'yauzl'
 import { text } from 'node:stream/consumers'
-import { cbzEntries } from '../src/server/cbz.ts'
+import { cbzEntries, pageName, writeCbz, type AddFile } from '../src/server/cbz.ts'
 import { expect, test, vi } from 'vitest'
 import { openDb } from '../src/server/db.ts'
 import { assignVolumes, enqueue, missingChapters, pageCountWarnings, runNext, scheduleChecks, type Ctx } from '../src/server/worker.ts'
@@ -392,11 +392,113 @@ test('a rebuild re-splits by size and deletes volumes past the new last one', as
   expect(existsSync(vol(3))).toBe(false)
 })
 
-test('a series still in a single legacy CBZ is left alone until it has been split', async () => {
-  const { db, ctx, sw, job } = setup([ch(1, 1)])
-  db.prepare(`update series set legacy_file = '/lib/S.cbz'`).run()
+// A v0.1-style single CBZ (or a volume) with chapters `numbers`, 2 pages each, plus cover.
+async function legacyCbz(path: string, numbers: number[]) {
+  const stage = mkdtempSync(join(tmpdir(), 'mangarr-stage-'))
+  const add: AddFile[] = [{ name: '0000-cover.jpg', path: join(stage, 'cover') }]
+  writeFileSync(join(stage, 'cover'), 'cover')
+  for (const n of numbers) for (const i of [0, 1]) {
+    const f = join(stage, `${n}-${i}`)
+    writeFileSync(f, `c${n}p${i}`)
+    add.push({ name: pageName(n, i, 'jpg'), path: f })
+  }
+  await writeCbz(path, add, { series: 'S' })
+}
+const chaptersIn = async (path: string) => [...new Set((await cbzEntries(path)).filter(n => n.includes('/')).map(n => Number(n.split('/')[0])))]
+
+test('a v0.1 single CBZ is split into volumes without downloading, then deleted', async () => {
+  const { db, ctx, sw, vol, dir, job } = setup([], 2)
+  const legacy = join(ctx.libraryDir, 'S.cbz')
+  await legacyCbz(legacy, [1, 2, 3, 4, 5])
+  db.prepare(`update series set legacy_file = ?, volumes_dirty = 1`).run(legacy)
+  db.prepare(`insert into chapters (series_id, number, suwayomi_chapter_id) values (1, 1, 1), (1, 2, 2), (1, 3, 3), (1, 4, 4), (1, 5, 5)`).run()
+  enqueue(db, 1, 'restructure')
+  await runNext(ctx)
+  expect(job()).toEqual({ state: 'done', error: null })
+  expect(sw.pages).not.toHaveBeenCalled()
+  expect(sw.image).not.toHaveBeenCalled()
+  expect(await chaptersIn(vol(1))).toEqual([1, 2])
+  expect(await chaptersIn(vol(3))).toEqual([5])
+  expect(await cbzEntries(vol(2))).toContain('0000-cover.jpg')
+  expect(await comicInfo(vol(2))).toContain('<Title>Vol. 2 (Ch. 3–4)</Title>')
+  expect(existsSync(legacy)).toBe(false)
+  expect(existsSync(join(dir, '.mangarr-tmp'))).toBe(false)
+  expect(volumes(db)).toEqual([[1, 1], [2, 1], [3, 2], [4, 2], [5, 3]])
+  expect(db.prepare(`select pages from chapters where number = 5`).get()).toEqual({ pages: 2 })
+  expect(db.prepare(`select legacy_file, volumes_dirty from series`).get()).toEqual({ legacy_file: null, volumes_dirty: 0 })
+})
+
+test('a check on a series that still needs splitting splits it first, then appends to the right volume', async () => {
+  const { db, ctx, vol } = setup([1, 2, 3].map(n => ch(n, n)), 2)
+  const legacy = join(ctx.libraryDir, 'S.cbz')
+  await legacyCbz(legacy, [1, 2])
+  db.prepare(`update series set legacy_file = ?, volumes_dirty = 1`).run(legacy)
+  db.prepare(`insert into chapters (series_id, number, suwayomi_chapter_id) values (1, 1, 1), (1, 2, 2)`).run()
   enqueue(db, 1, 'check')
   await runNext(ctx)
-  expect(sw.manga).not.toHaveBeenCalled()
-  expect(job().error).toContain('waiting to be split')
+  expect(await chaptersIn(vol(1))).toEqual([1, 2])
+  expect(await chaptersIn(vol(2))).toEqual([3])
+  expect(existsSync(legacy)).toBe(false)
+})
+
+test('moving a boundary moves chapters between volumes; merging deletes the emptied volume last', async () => {
+  const { db, ctx, sw, vol } = setup([1, 2, 3, 4].map(n => ch(n, n)), 2)
+  enqueue(db, 1, 'download')
+  await runNext(ctx)
+  sw.pages.mockClear()
+  db.prepare(`update chapters set volume = 2 where number = 2`).run() // Vol. 2 now starts at chapter 2
+  db.prepare(`update series set volumes_dirty = 1`).run()
+  enqueue(db, 1, 'restructure')
+  await runNext(ctx)
+  expect(await chaptersIn(vol(1))).toEqual([1])
+  expect(await chaptersIn(vol(2))).toEqual([2, 3, 4])
+  expect(await comicInfo(vol(2))).toContain('<Title>Vol. 2 (Ch. 2–4)</Title>')
+  expect(await cbzEntries(vol(1))).toContain('0000-cover.jpg')
+
+  db.prepare(`update chapters set volume = 1`).run() // merge everything into Vol. 1
+  enqueue(db, 1, 'restructure')
+  await runNext(ctx)
+  expect(await chaptersIn(vol(1))).toEqual([1, 2, 3, 4])
+  expect(existsSync(vol(2))).toBe(false)
+  expect(sw.pages).not.toHaveBeenCalled()
+})
+
+test('a restructure that died between renames runs again cleanly: duplicates are copied once', async () => {
+  const { db, ctx, vol, dir } = setup([], 2)
+  const legacy = join(ctx.libraryDir, 'S.cbz')
+  await legacyCbz(legacy, [1, 2, 3, 4])
+  mkdirSync(dir)
+  await legacyCbz(vol(1), [1, 2]) // renamed before the crash; the legacy file still has 1 and 2 too
+  db.prepare(`update series set legacy_file = ?, volumes_dirty = 1`).run(legacy)
+  db.prepare(`insert into chapters (series_id, number, suwayomi_chapter_id) values (1, 1, 1), (1, 2, 2), (1, 3, 3), (1, 4, 4)`).run()
+  enqueue(db, 1, 'restructure')
+  await runNext(ctx)
+  expect(await cbzEntries(vol(1))).toEqual(['ComicInfo.xml', '0000-cover.jpg', '0001.0/001.jpg', '0001.0/002.jpg', '0002.0/001.jpg', '0002.0/002.jpg'])
+  expect(await chaptersIn(vol(2))).toEqual([3, 4])
+  expect(existsSync(legacy)).toBe(false)
+})
+
+test('a chapter missing from every file fails the restructure and leaves the legacy CBZ alone', async () => {
+  const { db, ctx, vol, job } = setup([], 2)
+  const legacy = join(ctx.libraryDir, 'S.cbz')
+  await legacyCbz(legacy, [1, 2])
+  const before = readFileSync(legacy)
+  db.prepare(`update series set legacy_file = ?, volumes_dirty = 1`).run(legacy)
+  db.prepare(`insert into chapters (series_id, number, suwayomi_chapter_id) values (1, 1, 1), (1, 2, 2), (1, 3, 3)`).run()
+  enqueue(db, 1, 'restructure')
+  await runNext(ctx)
+  expect(job().state).toBe('failed')
+  expect(job().error).toContain('chapter 3 not found')
+  expect(readFileSync(legacy).equals(before)).toBe(true)
+  expect(existsSync(vol(1))).toBe(false)
+  expect(db.prepare(`select volumes_dirty from series`).get()).toEqual({ volumes_dirty: 1 })
+})
+
+test('a restructure and a check queue separately: neither covers the other', () => {
+  const { db } = setup([])
+  enqueue(db, 1, 'check')
+  enqueue(db, 1, 'restructure')
+  enqueue(db, 1, 'restructure')
+  enqueue(db, 1, 'check')
+  expect(db.prepare(`select kind from jobs order by id`).all()).toEqual([{ kind: 'check' }, { kind: 'restructure' }])
 })

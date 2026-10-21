@@ -100,7 +100,7 @@ Verification commands: `pnpm test`, `pnpm build`.
   - Verify: worker + cbz tests (assignment incl. auto-start at size, append to last volume, removed chapters), `pnpm test`, manual add of a 30-chapter series → Vol. 01 (25) + Vol. 02 (5).
   - Files: `db.ts`, `worker.ts`, `cbz.ts`, tests · Size: M
 
-- [ ] **T13: Restructure + migration**
+- [x] **T13: Restructure + migration**
   - Acceptance: `writeCbz` can take entries from several source CBZs. A `restructure` job rewrites volumes whose chapter set changed, streaming from the old files, then deletes obsolete files. On start, single-file series are migrated (old file deleted only after all volumes exist). API: `PUT /series/:id/volumes` (`{ starts: number[] }` or `{ size }` + re-split), validated; path change moves the folder.
   - Verify: tests for split/merge/migrate (original intact on failure, no entry lost or duplicated), `pnpm test`; manual: migrate a dev copy of VS, then TBATE in the cluster.
   - Files: `cbz.ts`, `worker.ts`, `api.ts`, `main.ts`, tests · Size: M

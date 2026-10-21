@@ -35,7 +35,7 @@ export function api(db: DatabaseSync, libraryDir: string, sw: typeof suwayomi = 
       db
         .prepare(
           `select s.id, s.title, s.suwayomi_manga_id, s.source_name, s.status, s.last_checked_at, s.last_error,
-                  count(c.id) as chapter_count, max(c.number) as latest_chapter,
+                  count(c.id) as chapter_count, max(c.number) as latest_chapter, count(distinct c.volume) as volume_count,
                   (select state from jobs j where j.series_id = s.id order by j.id desc limit 1) as job_state
            from series s left join chapters c on c.series_id = s.id and c.removed = 0
            group by s.id order by s.title collate nocase`,
@@ -59,7 +59,7 @@ export function api(db: DatabaseSync, libraryDir: string, sw: typeof suwayomi = 
     const seriesId = id(c.req.param('id'))
     const series = seriesId === null ? undefined : db.prepare(`select * from series where id = ?`).get(seriesId)
     if (!series) return c.json({ error: 'not found' }, 404)
-    const chapters = db.prepare(`select number, title, downloaded_at, removed, warning from chapters where series_id = ? order by number desc`).all(seriesId)
+    const chapters = db.prepare(`select number, title, downloaded_at, removed, warning, volume, pages from chapters where series_id = ? order by number desc`).all(seriesId)
     const jobs = db.prepare(`select id, kind, state, error, created_at, finished_at from jobs where series_id = ? order by id desc limit 10`).all(seriesId)
     return c.json({ ...series, chapters, jobs })
   })
@@ -91,14 +91,15 @@ export function api(db: DatabaseSync, libraryDir: string, sw: typeof suwayomi = 
     return c.json({ sourceName: manga.source.displayName })
   })
 
-  // Removal is applied by the worker (the only CBZ writer) on the job queued here.
+  // Removal is applied by the worker (the only CBZ writer): a restructure drops it from its volume without asking the source.
   app.post('/series/:id/chapters/:number/remove', c => {
     const seriesId = id(c.req.param('id'))
     const number = Number(c.req.param('number'))
     if (seriesId === null || !Number.isFinite(number)) return c.json({ error: 'bad id or chapter number' }, 400)
     const res = db.prepare(`update chapters set removed = 1 where series_id = ? and number = ?`).run(seriesId, number)
     if (!res.changes) return c.json({ error: 'not found' }, 404)
-    enqueue(db, seriesId, 'check')
+    db.prepare(`update series set volumes_dirty = 1 where id = ?`).run(seriesId)
+    enqueue(db, seriesId, 'restructure')
     return c.json({ queued: true }, 202)
   })
 
@@ -116,6 +117,49 @@ export function api(db: DatabaseSync, libraryDir: string, sw: typeof suwayomi = 
     if (!res.changes) return c.json({ error: 'not a removed chapter' }, 404)
     enqueue(db, seriesId, 'check')
     return c.json({ queued: true }, 202)
+  })
+
+  // Volume boundaries. { starts: [chapter numbers that begin a volume] } sets them by hand;
+  // { size, resplit } sets chapters per volume for new volumes and, with resplit, re-splits everything.
+  // The DB gets the new layout now; a restructure job makes the files match.
+  app.put('/series/:id/volumes', async c => {
+    const seriesId = id(c.req.param('id'))
+    if (seriesId === null || !db.prepare(`select 1 from series where id = ?`).get(seriesId)) return c.json({ error: 'not found' }, 404)
+    const body = await c.req.json().catch(() => ({}))
+    const starts = body.starts
+    const size = body.size
+    const validStarts = Array.isArray(starts) && starts.length <= 10000 && starts.every((n: unknown) => typeof n === 'number' && Number.isFinite(n))
+    const validSize = Number.isInteger(size) && size >= 1 && size <= 1000
+    if (validStarts === validSize) return c.json({ error: 'send either starts (array of chapter numbers) or size (integer 1–1000)' }, 400)
+    if (db.prepare(`select 1 from jobs where series_id = ? and state = 'running'`).get(seriesId)) return c.json({ error: 'a download is running; try again when it finishes' }, 409)
+
+    const numbers = (db.prepare(`select number from chapters where series_id = ? and removed = 0 order by number`).all(seriesId) as { number: number }[]).map(r => r.number)
+    let volumeOf: (n: number, i: number) => number
+    if (validStarts) {
+      const have = new Set(numbers)
+      const unknown = (starts as number[]).filter(n => !have.has(n))
+      if (unknown.length) return c.json({ error: `not a downloaded chapter: ${unknown.join(', ')}` }, 400)
+      const set = new Set(starts as number[])
+      let v = 0
+      const byNumber = new Map(numbers.map((n, i) => [n, i === 0 || set.has(n) ? ++v : v]))
+      volumeOf = n => byNumber.get(n)!
+    } else {
+      db.prepare(`update series set volume_size = ? where id = ?`).run(size, seriesId)
+      if (!body.resplit) return c.json({ volumeSize: size })
+      volumeOf = (_n, i) => Math.floor(i / size) + 1
+    }
+    db.exec('begin')
+    try {
+      const upd = db.prepare(`update chapters set volume = ? where series_id = ? and number = ?`)
+      numbers.forEach((n, i) => upd.run(volumeOf(n, i), seriesId, n))
+      db.prepare(`update series set volumes_dirty = 1 where id = ?`).run(seriesId)
+      db.exec('commit')
+    } catch (e) {
+      db.exec('rollback')
+      throw e
+    }
+    enqueue(db, seriesId, 'restructure')
+    return c.json({ volumes: numbers.length ? volumeOf(numbers.at(-1)!, numbers.length - 1) : 0 }, 202)
   })
 
   app.post('/series/:id/rebuild', c => {

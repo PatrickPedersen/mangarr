@@ -4,18 +4,20 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import type { DatabaseSync } from 'node:sqlite'
 import * as suwayomi from './suwayomi.ts'
 import type { Notify } from './notify.ts'
-import { cbzEntries, chapterDir, pageName, safeName, volumeName, writeCbz, type AddFile } from './cbz.ts'
+import { buildCbz, cbzEntries, chapterDir, cleanTmp, pageName, safeName, volumeName, writeCbz, type AddFile } from './cbz.ts'
 
 export type Ctx = { db: DatabaseSync; sw: Pick<typeof suwayomi, 'manga' | 'pages' | 'image'>; libraryDir: string; notify: Notify }
 type Series = {
   id: number; title: string; source_name: string; status: 'ok' | 'failing'; suwayomi_manga_id: number
-  dir: string; volume_size: number; legacy_file: string | null; resume_after: number | null
+  dir: string; volume_size: number; legacy_file: string | null; volumes_dirty: number; resume_after: number | null
 }
-type JobKind = 'check' | 'download' | 'rebuild'
+type JobKind = 'check' | 'download' | 'rebuild' | 'restructure'
 
 export function enqueue(db: DatabaseSync, seriesId: number, kind: JobKind) {
-  // A series never needs two pending jobs; the queued one will see everything.
-  const pending = db.prepare(`select id from jobs where series_id = ? and state = 'queued'`).get(seriesId) as { id: number } | undefined
+  // A series never needs two pending jobs of a sort; the queued one will see everything.
+  // Restructures are their own sort: they never touch the source, so a check doesn't cover one or vice versa.
+  const pending = (db.prepare(`select id, kind from jobs where series_id = ? and state = 'queued'`).all(seriesId) as { id: number; kind: JobKind }[])
+    .find(j => (j.kind === 'restructure') === (kind === 'restructure'))
   if (!pending) db.prepare(`insert into jobs (series_id, kind) values (?, ?)`).run(seriesId, kind)
   // ...except a rebuild does strictly more than a check, so it takes over the queued job.
   else if (kind === 'rebuild') db.prepare(`update jobs set kind = 'rebuild' where id = ?`).run(pending.id)
@@ -83,8 +85,6 @@ const range = (nums: number[]) => {
  * Chapters marked removed are dropped from the CBZ here and never fetched again, not even by `fresh`.
  */
 async function download({ db, sw, libraryDir, notify }: Ctx, series: Series, fresh: boolean) {
-  // ponytail: T13 splits these; until then they are left alone.
-  if (series.legacy_file) throw new Error('this series is still a single CBZ, waiting to be split into volumes')
   const { manga, chapters } = await sw.manga(series.suwayomi_manga_id)
   const rows = db.prepare(`select number, removed, volume, pages from chapters where series_id = ?`).all(series.id) as {
     number: number; removed: number; volume: number; pages: number | null
@@ -205,6 +205,104 @@ async function download({ db, sw, libraryDir, notify }: Ctx, series: Series, fre
   }
 }
 
+const volumeFile = (series: Series, v: number) => join(series.dir, volumeName(series.title, v))
+
+/**
+ * Makes the volume files match chapters.volume: after the user moved a boundary, changed the size,
+ * or when a v0.1 single CBZ (legacy_file) has to be split. Pages are copied from wherever they are
+ * now, found by reading the files rather than trusting the DB, so a restructure that died halfway
+ * can simply run again. Nothing is re-downloaded.
+ *
+ * Every rewritten volume is built before any is renamed into place, and a volume that gains
+ * chapters is renamed before the one that loses them: a crash between renames can duplicate a
+ * chapter, never lose one. Files that end up unused (the legacy CBZ, volumes past the last) are
+ * deleted only after that.
+ */
+async function restructure({ db, sw }: Ctx, series: Series) {
+  const rows = db.prepare(`select number, volume from chapters where series_id = ? and removed = 0 order by number`).all(series.id) as { number: number; volume: number | null }[]
+  // Chapters from a legacy CBZ have no volume yet: split them by size.
+  if (rows.some(r => r.volume === null)) {
+    const vol = assignVolumes([], rows.map(r => r.number), series.volume_size)
+    for (const r of rows) r.volume = vol.get(r.number)!
+  }
+  const prefix = `${safeName(series.title)} Vol. `
+  const isVolume = (f: string) => f.startsWith(prefix) && f.endsWith('.cbz') && /^\d+$/.test(f.slice(prefix.length, -4))
+  const files = [
+    ...(series.legacy_file && existsSync(series.legacy_file) ? [series.legacy_file] : []),
+    ...(existsSync(series.dir) ? readdirSync(series.dir).filter(isVolume).map(f => join(series.dir, f)) : []),
+  ]
+
+  // Where each chapter's pages are now, and what each file holds (chapter dir → page count).
+  const where = new Map<string, string>()
+  const content = new Map<string, Map<string, number>>()
+  for (const f of files) {
+    const counts = new Map<string, number>()
+    for (const n of await cbzEntries(f)) {
+      if (!n.includes('/')) continue
+      const d = n.split('/')[0]!
+      counts.set(d, (counts.get(d) ?? 0) + 1)
+      if (!where.has(d)) where.set(d, f)
+    }
+    content.set(f, counts)
+  }
+  const missing = rows.filter(r => !where.has(chapterDir(r.number)))
+  if (missing.length) {
+    const place = series.legacy_file ?? series.dir
+    throw new Error(`chapter${missing.length > 1 ? 's' : ''} ${missing.map(r => r.number).join(', ')} not found in ${place}. If it was moved, update the path; otherwise use Redownload all.`)
+  }
+
+  const want = new Map<number, string[]>()
+  for (const r of rows) want.set(r.volume!, [...(want.get(r.volume!) ?? []), chapterDir(r.number)])
+  const unchanged = (file: string, dirs: string[]) => content.get(file)?.size === dirs.length && dirs.every(d => content.get(file)!.has(d))
+  const rewrite = [...want].filter(([v, dirs]) => !unchanged(volumeFile(series, v), dirs))
+
+  // Metadata is nice to have; a source that's down must not block a restructure.
+  const meta = await sw.manga(series.suwayomi_manga_id).then(
+    ({ manga }) => ({ summary: manga.description, writer: manga.author, genre: manga.genre, web: manga.realUrl }),
+    () => ({}),
+  )
+  const built = new Map<string, string>() // target → temp file
+  const readsFrom = new Map<string, Set<string>>()
+  try {
+    for (const [v, dirs] of rewrite) {
+      const target = volumeFile(series, v)
+      const mine = new Set(dirs)
+      const from = [...new Set(dirs.map(d => where.get(d)!))]
+      readsFrom.set(target, new Set(from))
+      const numbers = rows.filter(r => r.volume === v).map(r => r.number)
+      mkdirSync(series.dir, { recursive: true })
+      const info = { series: series.title, ...meta, number: v, title: `Vol. ${v} (${range(numbers)})` }
+      built.set(target, await buildCbz(target, [], info, { fresh: true, from: from.map(path => ({ path, keep: (d: string) => mine.has(d) })) }))
+    }
+    const pending = new Set(built.keys())
+    while (pending.size) {
+      // Rename a volume only once every volume taking chapters from it is in place.
+      const ready = [...pending].filter(t => ![...pending].some(u => u !== t && readsFrom.get(u)!.has(t)))
+      for (const t of ready.length ? ready : [...pending]) {
+        renameSync(built.get(t)!, t)
+        pending.delete(t)
+      }
+    }
+  } finally {
+    for (const t of built.keys()) cleanTmp(t)
+  }
+  if (rows.length) {
+    const used = new Set([...want.keys()].map(v => volumeFile(series, v)))
+    for (const f of files) if (!used.has(f)) rmSync(f)
+  }
+
+  db.exec('begin')
+  try {
+    const upd = db.prepare(`update chapters set volume = ?, pages = ? where series_id = ? and number = ?`)
+    for (const r of rows) upd.run(r.volume, content.get(where.get(chapterDir(r.number))!)!.get(chapterDir(r.number))!, series.id, r.number)
+    db.prepare(`update series set legacy_file = null, volumes_dirty = 0 where id = ?`).run(series.id)
+    db.exec('commit')
+  } catch (e) {
+    db.exec('rollback')
+    throw e
+  }
+}
+
 const touch = (db: DatabaseSync, id: number) =>
   db.prepare(`update series set status = 'ok', last_checked_at = datetime('now'), last_error = null where id = ?`).run(id)
 
@@ -216,9 +314,11 @@ export async function runNext(ctx: Ctx) {
   if (!job) return false
   ctx.db.prepare(`update jobs set state = 'running' where id = ?`).run(job.id)
   try {
-    const series = ctx.db.prepare(`select * from series where id = ?`).get(job.series_id) as Series
+    const get = () => ctx.db.prepare(`select * from series where id = ?`).get(job.series_id) as Series
+    // Files first match the volumes the DB says, so a download never appends to a volume that's about to move.
+    if (job.kind === 'restructure' || get().volumes_dirty) await restructure(ctx, get())
     // 'check' and 'download' are the same work: diff against the source, fetch what's missing.
-    await download(ctx, series, job.kind === 'rebuild')
+    if (job.kind !== 'restructure') await download(ctx, get(), job.kind === 'rebuild')
     ctx.db.prepare(`update jobs set state = 'done', finished_at = datetime('now') where id = ?`).run(job.id)
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
@@ -244,6 +344,8 @@ export function scheduleChecks(db: DatabaseSync, hours: number) {
 export async function start(ctx: Ctx, checkIntervalHours: number) {
   // A job that was running when the pod died starts over; download() skips what's already recorded.
   ctx.db.exec(`update jobs set state = 'queued' where state = 'running'`)
+  // v0.1 single CBZs (and any restructure a crash interrupted) are split right away, not at the next check.
+  for (const { id } of ctx.db.prepare(`select id from series where volumes_dirty = 1`).all() as { id: number }[]) enqueue(ctx.db, id, 'restructure')
   scheduleChecks(ctx.db, checkIntervalHours)
   setInterval(() => scheduleChecks(ctx.db, checkIntervalHours), 60 * 60 * 1000)
   for (;;) if (!(await runNext(ctx))) await sleep(5000)

@@ -83,6 +83,7 @@ Why: BookOrbit's CBZ reader has no chapter navigation, so one 18,000-page book i
 - **Assignment:** every chapter row has a `volume`. A new chapter goes into the last volume while it holds fewer than `volume_size` chapters (default **25**, per series), otherwise it starts the next volume.
 - **Boundaries:** on the series page, chapters are grouped by volume. Any chapter can **start a volume here**; the first chapter of a volume can **merge into the previous**. **Re-split** reassigns every chapter by the current `volume_size`. Changes queue a `restructure` job.
 - **Restructure:** the new volume files are streamed straight from the old CBZs' entries (no re-download, no extraction to disk), each via temp file + rename. Old files that no longer correspond to a volume are deleted only after every new volume has been written. Peak extra disk = the size of the rewritten volumes.
+- **Removing a chapter** queues a restructure too, so it's dropped from its volume without contacting the source.
 - **Migration:** existing single-CBZ series are restructured into volumes on first start of v0.2, the same way. The old single file is deleted after its volumes exist.
 - **BookOrbit effects:** a migrated series appears as new books (progress on the old single book is lost). A volume rewritten by a boundary change keeps its path, so BookOrbit keeps the book, but page positions shift.
 

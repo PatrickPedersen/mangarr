@@ -90,7 +90,7 @@ test('switching source records the resume point and queues a check', async () =>
   expect(db.prepare(`select kind, state from jobs where series_id = 1`).all()).toEqual([{ kind: 'check', state: 'queued' }])
 })
 
-test('remove and restore chapters queue a check; restore refuses chapters from before a source switch', async () => {
+test('remove queues a restructure and restore a check; restore refuses chapters from before a source switch', async () => {
   const { db } = setup()
   db.prepare(`insert into chapters (series_id, number, suwayomi_chapter_id) values (1, 1, 1), (1, 2.5, 2)`).run()
   const app = api(db, '/lib', {} as typeof suwayomi)
@@ -105,5 +105,33 @@ test('remove and restore chapters queue a check; restore refuses chapters from b
   db.prepare(`update series set resume_after = null where id = 1`).run()
   expect((await post('/series/1/chapters/2.5/restore')).status).toBe(202)
   expect(db.prepare(`select count(*) n from chapters where number = 2.5`).get()).toEqual({ n: 0 })
-  expect(db.prepare(`select count(*) n from jobs where series_id = 1 and state = 'queued'`).get()).toEqual({ n: 1 })
+  expect(db.prepare(`select kind from jobs where series_id = 1 and state = 'queued' order by id`).all()).toEqual([{ kind: 'restructure' }, { kind: 'check' }])
+  expect(db.prepare(`select volumes_dirty from series where id = 1`).get()).toEqual({ volumes_dirty: 1 })
+})
+
+test('volume boundaries by hand or by size; the DB changes now and a restructure is queued', async () => {
+  const { db, app } = setup()
+  db.prepare(`insert into chapters (series_id, number, suwayomi_chapter_id, volume, removed) values (1, 1, 1, 1, 0), (1, 2, 2, 1, 0), (1, 2.5, 3, 1, 1), (1, 3, 4, 1, 0), (1, 4, 5, 1, 0), (1, 5, 6, 1, 0)`).run()
+  const put = (body: unknown) => app.request('/series/1/volumes', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+  const vols = () => db.prepare(`select number, volume from chapters where removed = 0 order by number`).all().map(r => (r as { volume: number }).volume)
+
+  expect((await put({ starts: [3, 5] })).status).toBe(202)
+  expect(vols()).toEqual([1, 1, 2, 2, 3])
+  expect(db.prepare(`select kind from jobs`).all()).toEqual([{ kind: 'restructure' }])
+  expect(db.prepare(`select volumes_dirty from series where id = 1`).get()).toEqual({ volumes_dirty: 1 })
+
+  expect(await (await put({ size: 2, resplit: true })).json()).toEqual({ volumes: 3 })
+  expect(vols()).toEqual([1, 1, 2, 2, 3])
+  expect((await put({ starts: [] })).status).toBe(202) // everything in one volume
+  expect(vols()).toEqual([1, 1, 1, 1, 1])
+  expect(await (await put({ size: 4 })).json()).toEqual({ volumeSize: 4 }) // future volumes only
+  expect(vols()).toEqual([1, 1, 1, 1, 1])
+  expect(db.prepare(`select volume_size from series where id = 1`).get()).toEqual({ volume_size: 4 })
+  expect(db.prepare(`select count(*) n from jobs`).get()).toEqual({ n: 1 }) // restructures queued once
+
+  for (const bad of [{}, { starts: [2.5] }, { starts: [99] }, { starts: 'x' }, { size: 0 }, { size: 1.5 }, { size: 2, starts: [3] }]) {
+    expect((await put(bad)).status, JSON.stringify(bad)).toBe(400)
+  }
+  db.prepare(`insert into jobs (series_id, kind, state) values (1, 'download', 'running')`).run()
+  expect((await put({ starts: [3] })).status).toBe(409)
 })

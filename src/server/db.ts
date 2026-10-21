@@ -15,6 +15,7 @@ create table if not exists series (
   dir text not null unique, -- folder holding the series' volume CBZs
   volume_size integer not null default 25, -- chapters per volume when a new one is started
   legacy_file text, -- pre-volumes single CBZ, waiting to be split into volumes
+  volumes_dirty integer not null default 0, -- chapters.volume changed; files not yet restructured to match
   added_at text not null default (datetime('now'))
 );
 create table if not exists chapters (
@@ -33,7 +34,7 @@ create table if not exists chapters (
 create table if not exists jobs (
   id integer primary key,
   series_id integer not null references series(id) on delete cascade,
-  kind text not null check (kind in ('check', 'download', 'rebuild')),
+  kind text not null check (kind in ('check', 'download', 'rebuild', 'restructure')),
   state text not null default 'queued' check (state in ('queued', 'running', 'done', 'failed')),
   error text,
   created_at text not null default (datetime('now')),
@@ -53,7 +54,14 @@ export function openDb(path: string) {
   add('chapters', 'warning', 'text')
   add('chapters', 'volume', 'integer')
   add('chapters', 'pages', 'integer')
+  add('series', 'volumes_dirty', 'integer not null default 0')
   if (cols('series').includes('file_path')) toVolumes(db)
+  // A CHECK constraint can't be altered either: copy jobs into a table with the new kind allowed.
+  if (!(db.prepare(`select sql from sqlite_master where name = 'jobs'`).get() as { sql: string }).sql.includes('restructure')) {
+    db.exec('begin')
+    db.exec(schema.slice(schema.indexOf('create table if not exists jobs')).replace('jobs (', 'jobs_v2 ('))
+    db.exec(`insert into jobs_v2 select id, series_id, kind, state, error, created_at, finished_at from jobs; drop table jobs; alter table jobs_v2 rename to jobs; commit`)
+  }
   return db
 }
 
@@ -73,8 +81,8 @@ function toVolumes(db: DatabaseSync) {
   try {
     // New table first, then rename: renaming the old one would repoint chapters' foreign key at it.
     db.exec(schema.slice(0, schema.indexOf(');') + 2).replace('series (', 'series_v2 ('))
-    const ins = db.prepare(`insert into series_v2 (id, title, suwayomi_manga_id, source_name, cover_url, status, last_checked_at, last_error, resume_after, dir, legacy_file, added_at)
-      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    const ins = db.prepare(`insert into series_v2 (id, title, suwayomi_manga_id, source_name, cover_url, status, last_checked_at, last_error, resume_after, dir, legacy_file, volumes_dirty, added_at)
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`)
     for (const r of rows) {
       ins.run(r.id, r.title, r.suwayomi_manga_id, r.source_name, r.cover_url, r.status, r.last_checked_at, r.last_error, r.resume_after, dirFor(String(r.file_path)), r.file_path, r.added_at)
     }
