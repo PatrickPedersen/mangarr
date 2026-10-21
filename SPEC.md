@@ -78,7 +78,7 @@ ComicInfo.xml
 
 Why: BookOrbit's CBZ reader has no chapter navigation, so one 18,000-page book is unreadable. BookOrbit does group books by `ComicInfo.xml` `Series` + `Number` and offers "next book" in the reader, so volumes read as one series.
 
-- **Layout:** `<library>/<Series Title>/<Series Title> Vol. 01.cbz`, `Vol. 02`, … (3-digit padding past 99). The series' path setting now points at the folder; moving it moves every volume. Inside each volume the CBZ layout is unchanged.
+- **Layout:** `<library>/<Series Title>/<Series Title> Vol. 1/<Series Title> Vol. 1.cbz`, `Vol. 2`, … One folder per volume: BookOrbit treats CBZs side by side in one folder as variants of a single book. The series' path setting now points at the folder; moving it moves every volume. Inside each volume the CBZ layout is unchanged.
 - **ComicInfo + cover:** `Series` = series title, `Number` = volume number, `Title` = `Vol. N (Ch. a–b)`. Every volume carries the series cover as `0000-cover`, so BookOrbit shows it instead of a random first page.
 - **Assignment:** every chapter row has a `volume`. A new chapter goes into the last volume while it holds fewer than `volume_size` chapters (default **25**, per series), otherwise it starts the next volume.
 - **Boundaries:** on the series page, chapters are grouped by volume. Any chapter can **start a volume here**; the first chapter of a volume can **merge into the previous**. **Re-split** reassigns every chapter by the current `volume_size`. Changes queue a `restructure` job.

@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import type { DatabaseSync } from 'node:sqlite'
 import * as suwayomi from './suwayomi.ts'
@@ -111,7 +111,7 @@ async function download({ db, sw, libraryDir, notify }: Ctx, series: Series, fre
 
   const base = fresh ? [] : kept
   const volumeOf = assignVolumes(base, todo.map(c => c.chapterNumber), series.volume_size)
-  const path = (v: number) => join(series.dir, volumeName(series.title, v))
+  const path = (v: number) => volumeFile(series, v)
   const drop = new Set(removed.map(r => chapterDir(r.number)))
   const targets = new Set(volumeOf.values())
   if (!fresh) {
@@ -167,18 +167,15 @@ async function download({ db, sw, libraryDir, notify }: Ctx, series: Series, fre
   const after = [...base, ...todo.map(c => ({ number: c.chapterNumber, volume: volumeOf.get(c.chapterNumber)! }))]
   // Series title from our record, not the source: a source switch must not split the series in BookOrbit.
   const info = { series: series.title, summary: manga.description, writer: manga.author, genre: manga.genre, web: manga.realUrl }
-  mkdirSync(series.dir, { recursive: true })
   for (const v of [...targets].sort((a, b) => a - b)) {
+    mkdirSync(dirname(path(v)), { recursive: true })
     const title = `Vol. ${v} (${range(after.filter(c => c.volume === v).map(c => c.number))})`
     await writeCbz(path(v), add.get(v) ?? [], { ...info, number: v, title }, { fresh, drop })
   }
   if (fresh) {
     // Volumes past the new last one (the source has fewer chapters now) are gone; their replacements exist.
     const lastVolume = Math.max(...targets)
-    const prefix = `${safeName(series.title)} Vol. `
-    for (const f of readdirSync(series.dir)) {
-      if (f.startsWith(prefix) && f.endsWith('.cbz') && Number(f.slice(prefix.length, -4)) > lastVolume) rmSync(join(series.dir, f))
-    }
+    for (const [v, f] of volumesOnDisk(series)) if (v > lastVolume) removeVolume(f)
   }
   // Recorded after the renames: a crash in between re-adds the same staged entries next time, which is harmless.
   db.exec('begin')
@@ -207,6 +204,23 @@ async function download({ db, sw, libraryDir, notify }: Ctx, series: Series, fre
 
 const volumeFile = (series: Series, v: number) => join(series.dir, volumeName(series.title, v))
 
+/** Volume CBZs present in the series folder, by volume number. */
+function volumesOnDisk(series: Series) {
+  const prefix = `${safeName(series.title)} Vol. `
+  const out = new Map<number, string>()
+  for (const f of existsSync(series.dir) ? readdirSync(series.dir) : []) {
+    const v = f.startsWith(prefix) && /^\d+$/.test(f.slice(prefix.length)) ? Number(f.slice(prefix.length)) : 0
+    if (v && existsSync(volumeFile(series, v))) out.set(v, volumeFile(series, v))
+  }
+  return out
+}
+
+const removeVolume = (file: string) => {
+  rmSync(file)
+  // The folder goes too, unless something else (not ours) is in it.
+  try { rmdirSync(dirname(file)) } catch {}
+}
+
 /**
  * Makes the volume files match chapters.volume: after the user moved a boundary, changed the size,
  * or when a v0.1 single CBZ (legacy_file) has to be split. Pages are copied from wherever they are
@@ -225,12 +239,8 @@ async function restructure({ db, sw }: Ctx, series: Series) {
     const vol = assignVolumes([], rows.map(r => r.number), series.volume_size)
     for (const r of rows) r.volume = vol.get(r.number)!
   }
-  const prefix = `${safeName(series.title)} Vol. `
-  const isVolume = (f: string) => f.startsWith(prefix) && f.endsWith('.cbz') && /^\d+$/.test(f.slice(prefix.length, -4))
-  const files = [
-    ...(series.legacy_file && existsSync(series.legacy_file) ? [series.legacy_file] : []),
-    ...(existsSync(series.dir) ? readdirSync(series.dir).filter(isVolume).map(f => join(series.dir, f)) : []),
-  ]
+  const legacy = series.legacy_file && existsSync(series.legacy_file) ? series.legacy_file : null
+  const files = [...(legacy ? [legacy] : []), ...volumesOnDisk(series).values()]
 
   // Where each chapter's pages are now, and what each file holds (chapter dir → page count).
   const where = new Map<string, string>()
@@ -270,7 +280,7 @@ async function restructure({ db, sw }: Ctx, series: Series) {
       const from = [...new Set(dirs.map(d => where.get(d)!))]
       readsFrom.set(target, new Set(from))
       const numbers = rows.filter(r => r.volume === v).map(r => r.number)
-      mkdirSync(series.dir, { recursive: true })
+      mkdirSync(dirname(target), { recursive: true })
       const info = { series: series.title, ...meta, number: v, title: `Vol. ${v} (${range(numbers)})` }
       built.set(target, await buildCbz(target, [], info, { fresh: true, from: from.map(path => ({ path, keep: (d: string) => mine.has(d) })) }))
     }
@@ -288,7 +298,7 @@ async function restructure({ db, sw }: Ctx, series: Series) {
   }
   if (rows.length) {
     const used = new Set([...want.keys()].map(v => volumeFile(series, v)))
-    for (const f of files) if (!used.has(f)) rmSync(f)
+    for (const f of files) if (!used.has(f)) f === legacy ? rmSync(f) : removeVolume(f)
   }
 
   db.exec('begin')

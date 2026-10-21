@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import yauzl from 'yauzl'
 import { text } from 'node:stream/consumers'
 import { cbzEntries, pageName, writeCbz, type AddFile } from '../src/server/cbz.ts'
@@ -15,7 +15,7 @@ function setup(chapters: Chapter[], volumeSize = 25) {
   const db = openDb(':memory:')
   const lib = mkdtempSync(join(tmpdir(), 'mangarr-'))
   const dir = join(lib, 'S')
-  const vol = (n: number) => join(dir, `S Vol. ${String(n).padStart(2, '0')}.cbz`)
+  const vol = (n: number) => join(dir, `S Vol. ${n}`, `S Vol. ${n}.cbz`)
   const file = vol(1)
   db.prepare(`insert into series (title, suwayomi_manga_id, source_name, dir, volume_size) values ('S', 7, 'src', ?, ?)`).run(dir, volumeSize)
   const sw = {
@@ -203,8 +203,8 @@ test('after a source switch only chapters above the old max are downloaded', asy
 })
 
 test('a new source whose numbering is far behind fails instead of silently finding nothing', async () => {
-  const { db, dir, file, ctx, job } = setup([ch(20, 1), ch(21, 2)])
-  mkdirSync(dir)
+  const { db, file, ctx, job } = setup([ch(20, 1), ch(21, 2)])
+  mkdirSync(dirname(file), { recursive: true })
   writeFileSync(file, '') // the CBZ exists; only the numbering is off
   db.prepare(`insert into chapters (series_id, number, suwayomi_chapter_id) values (1, 120, 1)`).run()
   db.prepare(`update series set resume_after = 120`).run()
@@ -380,7 +380,7 @@ test('removing a chapter rewrites only its volume', async () => {
 
 test('a rebuild re-splits by size and deletes volumes past the new last one', async () => {
   const chapters = [1, 2, 3, 4, 5].map(n => ch(n, n))
-  const { db, ctx, vol } = setup(chapters, 2)
+  const { db, ctx, vol, dir } = setup(chapters, 2)
   enqueue(db, 1, 'download')
   await runNext(ctx)
   db.prepare(`update series set volume_size = 3`).run()
@@ -390,6 +390,7 @@ test('a rebuild re-splits by size and deletes volumes past the new last one', as
   expect(volumes(db)).toEqual([[1, 1], [2, 1], [3, 1], [4, 2]])
   expect(existsSync(vol(2))).toBe(true)
   expect(existsSync(vol(3))).toBe(false)
+  expect(existsSync(join(dir, 'S Vol. 3'))).toBe(false) // its folder too
 })
 
 // A v0.1-style single CBZ (or a volume) with chapters `numbers`, 2 pages each, plus cover.
@@ -442,7 +443,7 @@ test('a check on a series that still needs splitting splits it first, then appen
 })
 
 test('moving a boundary moves chapters between volumes; merging deletes the emptied volume last', async () => {
-  const { db, ctx, sw, vol } = setup([1, 2, 3, 4].map(n => ch(n, n)), 2)
+  const { db, ctx, sw, vol, dir } = setup([1, 2, 3, 4].map(n => ch(n, n)), 2)
   enqueue(db, 1, 'download')
   await runNext(ctx)
   sw.pages.mockClear()
@@ -460,6 +461,7 @@ test('moving a boundary moves chapters between volumes; merging deletes the empt
   await runNext(ctx)
   expect(await chaptersIn(vol(1))).toEqual([1, 2, 3, 4])
   expect(existsSync(vol(2))).toBe(false)
+  expect(readdirSync(dir)).toEqual(['S Vol. 1']) // emptied volume folder removed, no temp dirs left
   expect(sw.pages).not.toHaveBeenCalled()
 })
 

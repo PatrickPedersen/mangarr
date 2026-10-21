@@ -144,4 +144,5 @@ export async function cbzEntries(path: string) {
 
 // Filesystem-safe and stable, so the same title always maps to the same folder and files.
 export const safeName = (title: string) => title.replace(/[\/\\:*?"<>|]/g, '').replace(/\s+/g, ' ').trim()
-export const volumeName = (title: string, volume: number) => `${safeName(title)} Vol. ${String(volume).padStart(2, '0')}.cbz`
+// Each volume gets its own folder: BookOrbit treats CBZs side by side in one folder as variants of one book.
+export const volumeName = (title: string, volume: number) => `${safeName(title)} Vol. ${volume}/${safeName(title)} Vol. ${volume}.cbz`

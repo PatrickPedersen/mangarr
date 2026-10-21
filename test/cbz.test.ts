@@ -102,9 +102,8 @@ test('a failed write leaves the original byte-identical and no temp file behind'
   expect(existsSync(join(dir, '.mangarr-tmp', 'S.cbz'))).toBe(false)
 })
 
-test('volumeName strips path and reserved characters and pads the volume', () => {
-  expect(volumeName('Solo Leveling: Ragnarok / Part 2?', 3)).toBe('Solo Leveling Ragnarok Part 2 Vol. 03.cbz')
-  expect(volumeName('S', 120)).toBe('S Vol. 120.cbz')
+test('volumeName gives each volume its own folder and strips reserved characters', () => {
+  expect(volumeName('Solo Leveling: Ragnarok / Part 2?', 3)).toBe('Solo Leveling Ragnarok Part 2 Vol. 3/Solo Leveling Ragnarok Part 2 Vol. 3.cbz')
 })
 
 test('ComicInfo carries the volume number and title so BookOrbit orders volumes as one series', async () => {
