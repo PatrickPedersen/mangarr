@@ -27,7 +27,7 @@ onMounted(() => {
 onUnmounted(() => clearInterval(timer))
 
 const subtitle = (s: Series) =>
-  s.chapter_count ? `${s.chapter_count} ch · ${s.source_name}` : s.source_name
+  s.chapter_count ? `${s.volume_count > 1 ? `${s.volume_count} vols · ` : ''}${s.chapter_count} ch · ${s.source_name}` : s.source_name
 </script>
 
 <template>

@@ -13,6 +13,7 @@ export const api = {
   get: <T>(url: string) => request<T>('GET', url),
   post: <T>(url: string, body: unknown) => request<T>('POST', url, body),
   patch: <T>(url: string, body: unknown) => request<T>('PATCH', url, body),
+  put: <T>(url: string, body: unknown) => request<T>('PUT', url, body),
 }
 
 export type Source = { id: string; displayName: string }
@@ -26,16 +27,18 @@ export type Series = {
   last_checked_at: string | null
   last_error: string | null
   chapter_count: number
+  volume_count: number
   latest_chapter: number | null
   job_state: 'queued' | 'running' | 'done' | 'failed' | null
 }
 
 export type Job = { id: number; kind: string; state: 'queued' | 'running' | 'done' | 'failed'; error: string | null; created_at: string; finished_at: string | null }
-export type SeriesDetail = Omit<Series, 'chapter_count' | 'latest_chapter' | 'job_state'> & {
+export type Chapter = { number: number; title: string | null; downloaded_at: string; removed: number; warning: string | null; volume: number | null; pages: number | null }
+export type SeriesDetail = Omit<Series, 'chapter_count' | 'volume_count' | 'latest_chapter' | 'job_state'> & {
   dir: string
   volume_size: number
   added_at: string
-  chapters: { number: number; title: string | null; downloaded_at: string; removed: number; warning: string | null }[]
+  chapters: Chapter[]
   jobs: Job[]
 }
 

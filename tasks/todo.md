@@ -105,7 +105,7 @@ Verification commands: `pnpm test`, `pnpm build`.
   - Verify: tests for split/merge/migrate (original intact on failure, no entry lost or duplicated), `pnpm test`; manual: migrate a dev copy of VS, then TBATE in the cluster.
   - Files: `cbz.ts`, `worker.ts`, `api.ts`, `main.ts`, tests · Size: M
 
-- [ ] **T14: Volume UI**
+- [x] **T14: Volume UI**
   - Acceptance: series page groups chapters by volume (header: volume, chapter range, page count), per-row "Start volume here", per-volume "Merge into previous", volume size input + "Re-split", library card shows volume count.
   - Verify: `pnpm typecheck`, `pnpm build`, manual check in the browser.
   - Files: `pages/Series.vue`, `lib/api.ts`, `pages/Library.vue` · Size: S
