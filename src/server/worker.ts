@@ -175,7 +175,7 @@ async function download({ db, sw, libraryDir, notify }: Ctx, series: Series, fre
   if (fresh) {
     // Volumes past the new last one (the source has fewer chapters now) are gone; their replacements exist.
     const lastVolume = Math.max(...targets)
-    for (const [v, f] of volumesOnDisk(series)) if (v > lastVolume) removeVolume(f)
+    for (const { v, path: f } of volumesOnDisk(series)) if (v > lastVolume || f !== path(v)) removeVolume(series, f)
   }
   // Recorded after the renames: a crash in between re-adds the same staged entries next time, which is harmless.
   db.exec('begin')
@@ -204,21 +204,27 @@ async function download({ db, sw, libraryDir, notify }: Ctx, series: Series, fre
 
 const volumeFile = (series: Series, v: number) => join(series.dir, volumeName(series.title, v))
 
-/** Volume CBZs present in the series folder, by volume number. */
+/**
+ * Volume CBZs in the series folder. Besides the current layout this finds what v0.2.0–0.2.1 wrote
+ * ("Vol. 07.cbz" side by side) and what BookOrbit made of that ("Vol. 07/Vol. 07.cbz"); a
+ * restructure moves those to volumeFile().
+ */
 function volumesOnDisk(series: Series) {
   const prefix = `${safeName(series.title)} Vol. `
-  const out = new Map<number, string>()
+  const num = (name: string) => (name.startsWith(prefix) && /^\d+$/.test(name.slice(prefix.length)) ? Number(name.slice(prefix.length)) : 0)
+  const out: { v: number; path: string }[] = []
   for (const f of existsSync(series.dir) ? readdirSync(series.dir) : []) {
-    const v = f.startsWith(prefix) && /^\d+$/.test(f.slice(prefix.length)) ? Number(f.slice(prefix.length)) : 0
-    if (v && existsSync(volumeFile(series, v))) out.set(v, volumeFile(series, v))
+    if (f.endsWith('.cbz') && num(f.slice(0, -4))) out.push({ v: num(f.slice(0, -4)), path: join(series.dir, f) })
+    else if (num(f) && existsSync(join(series.dir, f, `${f}.cbz`))) out.push({ v: num(f), path: join(series.dir, f, `${f}.cbz`) })
   }
   return out
 }
+const misplaced = (series: Series) => volumesOnDisk(series).some(({ v, path }) => path !== volumeFile(series, v))
 
-const removeVolume = (file: string) => {
+const removeVolume = (series: Series, file: string) => {
   rmSync(file)
-  // The folder goes too, unless something else (not ours) is in it.
-  try { rmdirSync(dirname(file)) } catch {}
+  // Its own folder goes too, unless something else (not ours) is in it.
+  if (dirname(file) !== series.dir) try { rmdirSync(dirname(file)) } catch {}
 }
 
 /**
@@ -240,7 +246,7 @@ async function restructure({ db, sw }: Ctx, series: Series) {
     for (const r of rows) r.volume = vol.get(r.number)!
   }
   const legacy = series.legacy_file && existsSync(series.legacy_file) ? series.legacy_file : null
-  const files = [...(legacy ? [legacy] : []), ...volumesOnDisk(series).values()]
+  const files = [...(legacy ? [legacy] : []), ...volumesOnDisk(series).map(f => f.path)]
 
   // Where each chapter's pages are now, and what each file holds (chapter dir → page count).
   const where = new Map<string, string>()
@@ -298,7 +304,7 @@ async function restructure({ db, sw }: Ctx, series: Series) {
   }
   if (rows.length) {
     const used = new Set([...want.keys()].map(v => volumeFile(series, v)))
-    for (const f of files) if (!used.has(f)) f === legacy ? rmSync(f) : removeVolume(f)
+    for (const f of files) if (!used.has(f)) f === legacy ? rmSync(f) : removeVolume(series, f)
   }
 
   db.exec('begin')
@@ -326,7 +332,7 @@ export async function runNext(ctx: Ctx) {
   try {
     const get = () => ctx.db.prepare(`select * from series where id = ?`).get(job.series_id) as Series
     // Files first match the volumes the DB says, so a download never appends to a volume that's about to move.
-    if (job.kind === 'restructure' || get().volumes_dirty) await restructure(ctx, get())
+    if (job.kind === 'restructure' || get().volumes_dirty || misplaced(get())) await restructure(ctx, get())
     // 'check' and 'download' are the same work: diff against the source, fetch what's missing.
     if (job.kind !== 'restructure') await download(ctx, get(), job.kind === 'rebuild')
     ctx.db.prepare(`update jobs set state = 'done', finished_at = datetime('now') where id = ?`).run(job.id)

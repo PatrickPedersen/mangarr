@@ -504,3 +504,22 @@ test('a restructure and a check queue separately: neither covers the other', () 
   enqueue(db, 1, 'check')
   expect(db.prepare(`select kind from jobs order by id`).all()).toEqual([{ kind: 'check' }, { kind: 'restructure' }])
 })
+
+test.each([
+  ['v0.2.0 flat, padded', (n: number) => `S Vol. 0${n}.cbz`],
+  ['moved by BookOrbit into folders, padded', (n: number) => `S Vol. 0${n}/S Vol. 0${n}.cbz`],
+])('volumes in the %s layout are found and moved to the current one before a check appends', async (_, name) => {
+  const chapters = [1, 2, 3].map(n => ch(n, n))
+  const { db, ctx, dir, vol, sw, job } = setup(chapters, 2)
+  await legacyCbz(join(dir, name(1)), [1, 2])
+  await legacyCbz(join(dir, name(2)), [3])
+  db.prepare(`insert into chapters (series_id, number, suwayomi_chapter_id, volume, pages) values (1, 1, 1, 1, 2), (1, 2, 2, 1, 2), (1, 3, 3, 2, 2)`).run()
+  chapters.push(ch(4, 4))
+  enqueue(db, 1, 'check')
+  await runNext(ctx)
+  expect(job()).toEqual({ state: 'done', error: null })
+  expect(sw.pages.mock.calls.map(c => c[0])).toEqual([4]) // only the new chapter downloaded
+  expect(await chaptersIn(vol(1))).toEqual([1, 2])
+  expect(await chaptersIn(vol(2))).toEqual([3, 4])
+  expect(readdirSync(dir).sort()).toEqual(['S Vol. 1', 'S Vol. 2']) // old files and folders gone
+})
