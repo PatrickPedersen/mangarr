@@ -5,7 +5,7 @@ import type { DatabaseSync } from 'node:sqlite'
 import * as suwayomi from './suwayomi.ts'
 import type { Notify } from './notify.ts'
 import { compareChapters, firstChapter, lastChapter } from './chapterOrder.ts'
-import { buildCbz, cbzEntries, chapterDir, cleanTmp, comicInfoTitle, pageName, safeName, volumeName, writeCbz, type AddFile } from './cbz.ts'
+import { buildCbz, cbzEntries, chapterDir, cleanTmp, comicInfoTitle, isGeneratedTitle, readComicInfo, pageName, safeName, volumeName, writeCbz, type AddFile } from './cbz.ts'
 
 export type Ctx = { db: DatabaseSync; sw: Pick<typeof suwayomi, 'manga' | 'pages' | 'image'>; libraryDir: string; notify: Notify }
 type Series = {
@@ -112,22 +112,16 @@ async function download({ db, sw, libraryDir, notify }: Ctx, series: Series, fre
   }
   if ((fresh || kept.length === 0) && todo.length === 0) throw new Error('source returned no downloadable chapters')
 
+  // Removed chapters and the volume files already match the DB: runNext reconciled them first.
+  if (todo.length === 0) return touch(db, series.id)
   const base = fresh ? [] : kept
   const volumeOf = assignVolumes(base, todo.map(c => c.chapterNumber), series.volume_size)
-  const path = (v: number) => volumeFile(series, v)
+  const after = [...base, ...todo.map(c => ({ number: c.chapterNumber, volume: volumeOf.get(c.chapterNumber)! }))]
+  const found = await scan(series)
+  const located = locate(series, wanted(after), found, series.legacy_file)
+  const path = (v: number) => located.get(v)!
   const drop = new Set(removed.map(r => chapterDir(r.number)))
-  const targets = new Set(volumeOf.values())
-  if (!fresh) {
-    for (const v of new Set(removed.map(r => r.volume))) {
-      if (existsSync(path(v)) && (await cbzEntries(path(v))).some(n => drop.has(n.split('/')[0]!))) targets.add(v)
-    }
-  }
-  if (targets.size === 0) return touch(db, series.id)
-  for (const v of targets) {
-    if (!fresh && kept.some(r => r.volume === v) && !existsSync(path(v))) {
-      throw new Error(`${path(v)} not found. If the series was moved, update the path on the series page.`)
-    }
-  }
+  const targets = fresh ? new Set(after.map(c => c.volume)) : new Set(volumeOf.values())
 
   // Keyed by id under the library root, so changing the series' path doesn't orphan staged pages.
   const stage = join(libraryDir, '.mangarr-tmp', `series-${series.id}`)
@@ -167,7 +161,6 @@ async function download({ db, sw, libraryDir, notify }: Ctx, series: Series, fre
   }
 
   const warnings = pageCountWarnings(base.flatMap(r => (r.pages === null ? [] : [r.pages])), newCounts)
-  const after = [...base, ...todo.map(c => ({ number: c.chapterNumber, volume: volumeOf.get(c.chapterNumber)! }))]
   // Series title from our record, not the source: a source switch must not split the series in BookOrbit.
   const info = { series: series.title, summary: manga.description, writer: manga.author, genre: manga.genre, web: manga.realUrl }
   for (const v of [...targets].sort((a, b) => a - b)) {
@@ -176,16 +169,16 @@ async function download({ db, sw, libraryDir, notify }: Ctx, series: Series, fre
     await writeCbz(path(v), add.get(v) ?? [], { ...info, number: v, title }, { fresh, drop })
   }
   if (fresh) {
-    // Volumes past the new last one (the source has fewer chapters now) are gone; their replacements exist.
-    const lastVolume = Math.max(...targets)
-    for (const { v, path: f } of volumesOnDisk(series)) if (v > lastVolume || f !== path(v)) removeVolume(series, f)
+    // Files no volume uses any more (the source has fewer chapters now, a legacy CBZ) go; their replacements exist.
+    const used = new Set(located.values())
+    for (const f of found.content.keys()) if (!used.has(f)) discard(series, f)
   }
   // Recorded after the renames: a crash in between re-adds the same staged entries next time, which is harmless.
   db.exec('begin')
   try {
     if (fresh) {
       db.prepare(`delete from chapters where series_id = ? and removed = 0`).run(series.id)
-      db.prepare(`update series set resume_after = null where id = ?`).run(series.id)
+      db.prepare(`update series set resume_after = null, legacy_file = null, volumes_dirty = 0 where id = ?`).run(series.id)
     }
     const ins = db.prepare(`insert or ignore into chapters (series_id, number, title, suwayomi_chapter_id, warning, volume, pages) values (?, ?, ?, ?, ?, ?, ?)`)
     for (const ch of todo) {
@@ -207,27 +200,79 @@ async function download({ db, sw, libraryDir, notify }: Ctx, series: Series, fre
 
 const volumeFile = (series: Series, v: number) => join(series.dir, volumeName(series.title, v))
 
+const isPage = (name: string) => /^\d{4}\.\d+\/\d{3}\.\w+$/.test(name)
+
 /**
- * Volume CBZs in the series folder. Besides the current layout this finds what v0.2.0–0.2.1 wrote
- * ("Vol. 07.cbz" side by side) and what BookOrbit made of that ("Vol. 07/Vol. 07.cbz"); a
- * restructure moves those to volumeFile().
+ * Every CBZ of ours in the series folder (directly or one folder down) plus the legacy file, with the
+ * chapters each holds (chapter dir → page count). Found by content, never by name: BookOrbit renames
+ * and regroups volumes ("01. Beginning after the End, Vol. 1 (comic) (2022)/…"), and older Mangarr
+ * versions used other names. Our files are recognisable by their "0001.0/001.jpg" entries.
  */
-function volumesOnDisk(series: Series) {
-  const prefix = `${safeName(series.title)} Vol. `
-  const num = (name: string) => (name.startsWith(prefix) && /^\d+$/.test(name.slice(prefix.length)) ? Number(name.slice(prefix.length)) : 0)
-  const out: { v: number; path: string }[] = []
-  for (const f of existsSync(series.dir) ? readdirSync(series.dir) : []) {
-    if (f.endsWith('.cbz') && num(f.slice(0, -4))) out.push({ v: num(f.slice(0, -4)), path: join(series.dir, f) })
-    else if (num(f) && existsSync(join(series.dir, f, `${f}.cbz`))) out.push({ v: num(f), path: join(series.dir, f, `${f}.cbz`) })
+async function scan(series: Series) {
+  const candidates = series.legacy_file && existsSync(series.legacy_file) ? [series.legacy_file] : []
+  for (const e of existsSync(series.dir) ? readdirSync(series.dir, { withFileTypes: true }) : []) {
+    if (e.name.startsWith('.')) continue
+    const p = join(series.dir, e.name)
+    if (e.isFile() && e.name.endsWith('.cbz')) candidates.push(p)
+    else if (e.isDirectory()) for (const f of readdirSync(p)) if (!f.startsWith('.') && f.endsWith('.cbz')) candidates.push(join(p, f))
+  }
+  const content = new Map<string, Map<string, number>>()
+  const numbers = new Map<string, number>() // the volume each file was written as (ComicInfo <Number>)
+  for (const f of candidates) {
+    // Unreadable (half-copied, not a zip): not something we can use or should touch.
+    const entries = await cbzEntries(f).catch(() => [])
+    // Ours only if every entry is laid out the way Mangarr writes it: anything else BookOrbit (or you) put
+    // in the folder, like a purchased volume, is never read from, rewritten or deleted.
+    if (!entries.every(n => n === 'ComicInfo.xml' || n.startsWith('0000-cover.') || isPage(n))) continue
+    const counts = new Map<string, number>()
+    for (const n of entries) if (isPage(n)) counts.set(n.split('/')[0]!, (counts.get(n.split('/')[0]!) ?? 0) + 1)
+    if (!counts.size) continue
+    content.set(f, counts)
+    const n = Number((await readComicInfo(f).catch(() => null))?.match(/<Number>\s*(\d+)\s*<\/Number>/)?.[1])
+    if (n) numbers.set(f, n)
+  }
+  return { content, numbers }
+}
+
+const wanted = (rows: { number: number; volume: number | null }[]) => {
+  const want = new Map<number, string[]>()
+  for (const r of rows) want.set(r.volume!, [...(want.get(r.volume!) ?? []), chapterDir(r.number)])
+  return want
+}
+
+/**
+ * Which file is each volume, so a rewrite lands back on the same path (and the same BookOrbit book,
+ * under whatever name BookOrbit gave it): the file written as that volume number if it still holds
+ * any of its chapters, else the one holding most of them. Volumes with no file yet get volumeFile(),
+ * or a numbered variant if that path belongs to something else.
+ */
+function locate(series: Series, want: Map<number, string[]>, { content, numbers }: Awaited<ReturnType<typeof scan>>, legacy: string | null) {
+  const pairs: [number, number, string][] = []
+  for (const [v, dirs] of want) for (const [f, has] of content) {
+    const overlap = f === legacy ? 0 : dirs.filter(d => has.has(d)).length
+    if (overlap) pairs.push([overlap + (numbers.get(f) === v ? 1e6 : 0), v, f])
+  }
+  pairs.sort((a, b) => b[0] - a[0])
+  const out = new Map<number, string>()
+  const taken = new Set<string>()
+  for (const [, v, f] of pairs) if (!out.has(v) && !taken.has(f)) (out.set(v, f), taken.add(f))
+  for (const v of want.keys()) {
+    if (out.has(v)) continue
+    let p = volumeFile(series, v)
+    for (let k = 2; taken.has(p) || (existsSync(p) && !content.has(p)); k++) {
+      const base = `${safeName(series.title)} Vol. ${v} (${k})`
+      p = join(series.dir, base, `${base}.cbz`)
+    }
+    out.set(v, p)
+    taken.add(p)
   }
   return out
 }
-const misplaced = (series: Series) => volumesOnDisk(series).some(({ v, path }) => path !== volumeFile(series, v))
 
-const removeVolume = (series: Series, file: string) => {
+/** Deletes a file of ours, and its folder if that's now empty and inside the series folder. */
+const discard = (series: Series, file: string) => {
   rmSync(file)
-  // Its own folder goes too, unless something else (not ours) is in it.
-  if (dirname(file) !== series.dir) try { rmdirSync(dirname(file)) } catch {}
+  if (dirname(file).startsWith(series.dir + '/')) try { rmdirSync(dirname(file)) } catch {}
 }
 
 /**
@@ -250,40 +295,33 @@ async function restructure({ db, sw }: Ctx, series: Series) {
     for (const r of rows) r.volume = vol.get(r.number)!
   }
   const legacy = series.legacy_file && existsSync(series.legacy_file) ? series.legacy_file : null
-  const files = [...(legacy ? [legacy] : []), ...volumesOnDisk(series).map(f => f.path)]
-
-  // Where each chapter's pages are now, and what each file holds (chapter dir → page count).
+  // What each file holds, and where each chapter's pages are now (first file wins if duplicated).
+  const found = await scan(series)
+  const { content } = found
   const where = new Map<string, string>()
-  const content = new Map<string, Map<string, number>>()
-  for (const f of files) {
-    const counts = new Map<string, number>()
-    for (const n of await cbzEntries(f)) {
-      if (!n.includes('/')) continue
-      const d = n.split('/')[0]!
-      counts.set(d, (counts.get(d) ?? 0) + 1)
-      if (!where.has(d)) where.set(d, f)
-    }
-    content.set(f, counts)
-  }
+  for (const [f, counts] of content) for (const d of counts.keys()) if (!where.has(d)) where.set(d, f)
   const missing = rows.filter(r => !where.has(chapterDir(r.number)))
   if (missing.length) {
     const place = series.legacy_file ?? series.dir
     throw new Error(`chapter${missing.length > 1 ? 's' : ''} ${missing.map(r => r.number).join(', ')} not found in ${place}. If it was moved, update the path; otherwise use Redownload all.`)
   }
 
-  const want = new Map<number, string[]>()
-  for (const r of rows) want.set(r.volume!, [...(want.get(r.volume!) ?? []), chapterDir(r.number)])
+  const want = wanted(rows)
+  const located = locate(series, want, found, legacy)
   const titleOf = (v: number) => volumeTitle(series, v, rows.filter(r => r.volume === v).map(r => r.number))
   const unchanged = async (v: number, dirs: string[]) => {
-    const file = volumeFile(series, v)
+    const file = located.get(v)!
     const has = content.get(file)
-    return has?.size === dirs.length && dirs.every(d => has.has(d)) && (await comicInfoTitle(file)) === titleOf(v)
+    if (!(has?.size === dirs.length && dirs.every(d => has.has(d)))) return false
+    // A title set by hand in BookOrbit is kept, so only a stale generated one needs a rewrite.
+    const title = await comicInfoTitle(file)
+    return title === titleOf(v) || (title !== null && !isGeneratedTitle(title))
   }
   const rewrite: [number, string[]][] = []
   for (const [v, dirs] of want) if (!(await unchanged(v, dirs))) rewrite.push([v, dirs])
 
   // Metadata is nice to have; a source that's down must not block a restructure.
-  const meta = await sw.manga(series.suwayomi_manga_id).then(
+  const meta = rewrite.length === 0 ? {} : await sw.manga(series.suwayomi_manga_id).then(
     ({ manga }) => ({ summary: manga.description, writer: manga.author, genre: manga.genre, web: manga.realUrl }),
     () => ({}),
   )
@@ -291,7 +329,7 @@ async function restructure({ db, sw }: Ctx, series: Series) {
   const readsFrom = new Map<string, Set<string>>()
   try {
     for (const [v, dirs] of rewrite) {
-      const target = volumeFile(series, v)
+      const target = located.get(v)!
       const mine = new Set(dirs)
       const from = [...new Set(dirs.map(d => where.get(d)!))]
       readsFrom.set(target, new Set(from))
@@ -312,8 +350,8 @@ async function restructure({ db, sw }: Ctx, series: Series) {
     for (const t of built.keys()) cleanTmp(t)
   }
   if (rows.length) {
-    const used = new Set([...want.keys()].map(v => volumeFile(series, v)))
-    for (const f of files) if (!used.has(f)) f === legacy ? rmSync(f) : removeVolume(series, f)
+    const used = new Set(located.values())
+    for (const f of content.keys()) if (!used.has(f)) discard(series, f)
   }
 
   db.exec('begin')
@@ -340,8 +378,10 @@ export async function runNext(ctx: Ctx) {
   ctx.db.prepare(`update jobs set state = 'running' where id = ?`).run(job.id)
   try {
     const get = () => ctx.db.prepare(`select * from series where id = ?`).get(job.series_id) as Series
-    // Files first match the volumes the DB says, so a download never appends to a volume that's about to move.
-    if (job.kind === 'restructure' || get().volumes_dirty || misplaced(get())) await restructure(ctx, get())
+    // Files first match the volumes the DB says, so a download never appends to a volume that's about to
+    // move and picks up anything changed outside Mangarr. Cheap when nothing changed: it only reads indexes.
+    // A rebuild replaces everything anyway, unless a pending restructure (e.g. a legacy split) comes first.
+    if (job.kind !== 'rebuild' || get().volumes_dirty) await restructure(ctx, get())
     // 'check' and 'download' are the same work: diff against the source, fetch what's missing.
     if (job.kind !== 'restructure') await download(ctx, get(), job.kind === 'rebuild')
     ctx.db.prepare(`update jobs set state = 'done', finished_at = datetime('now') where id = ?`).run(job.id)

@@ -205,8 +205,7 @@ test('after a source switch only chapters above the old max are downloaded', asy
 
 test('a new source whose numbering is far behind fails instead of silently finding nothing', async () => {
   const { db, file, ctx, job } = setup([ch(20, 1), ch(21, 2)])
-  mkdirSync(dirname(file), { recursive: true })
-  writeFileSync(file, '') // the CBZ exists; only the numbering is off
+  await legacyCbz(file, [120]) // the CBZ exists; only the numbering is off
   db.prepare(`insert into chapters (series_id, number, suwayomi_chapter_id) values (1, 120, 1)`).run()
   db.prepare(`update series set resume_after = 120`).run()
   enqueue(db, 1, 'check')
@@ -509,20 +508,24 @@ test('a restructure and a check queue separately: neither covers the other', () 
 test.each([
   ['v0.2.0 flat, padded', (n: number) => `S Vol. 0${n}.cbz`],
   ['moved by BookOrbit into folders, padded', (n: number) => `S Vol. 0${n}/S Vol. 0${n}.cbz`],
-])('volumes in the %s layout are found and moved to the current one before a check appends', async (_, name) => {
+  ['renamed by BookOrbit after matching metadata', (n: number) => `0${n}. Some title, Vol. ${n} (comic) (2022)/0${n}. Some title, Vol. ${n} (comic) (2022).cbz`],
+])('volumes in the %s layout are found by content and kept where they are', async (_, name) => {
   const chapters = [1, 2, 3].map(n => ch(n, n))
   const { db, ctx, dir, vol, sw, job } = setup(chapters, 2)
   await legacyCbz(join(dir, name(1)), [1, 2])
   await legacyCbz(join(dir, name(2)), [3])
+  for (const v of [1, 2]) await writeCbz(join(dir, name(v)), [], { series: 'S', number: v, title: `S Vol. ${v} (Ch. x)` })
   db.prepare(`insert into chapters (series_id, number, suwayomi_chapter_id, volume, pages) values (1, 1, 1, 1, 2), (1, 2, 2, 1, 2), (1, 3, 3, 2, 2)`).run()
-  chapters.push(ch(4, 4))
+  const before = readdirSync(dir).sort()
+  chapters.push(ch(4, 4), ch(5, 5))
   enqueue(db, 1, 'check')
   await runNext(ctx)
   expect(job()).toEqual({ state: 'done', error: null })
-  expect(sw.pages.mock.calls.map(c => c[0])).toEqual([4]) // only the new chapter downloaded
-  expect(await chaptersIn(vol(1))).toEqual([1, 2])
-  expect(await chaptersIn(vol(2))).toEqual([3, 4])
-  expect(readdirSync(dir).sort()).toEqual(['S Vol. 1', 'S Vol. 2']) // old files and folders gone
+  expect(sw.pages.mock.calls.map(c => c[0])).toEqual([4, 5]) // only new chapters downloaded
+  expect(await chaptersIn(join(dir, name(1)))).toEqual([1, 2])
+  expect(await chaptersIn(join(dir, name(2)))).toEqual([3, 4]) // appended under its existing name
+  expect(await chaptersIn(vol(3))).toEqual([5]) // a brand-new volume gets Mangarr's name
+  expect(readdirSync(dir).sort()).toEqual([...before, 'S Vol. 3'].sort())
 })
 
 test('sub-chapters order as readers number them: 175.2 < 175.9 < 175.11, all between 175 and 176', () => {
@@ -554,4 +557,32 @@ test('a volume whose ComicInfo title is out of date is rewritten; an up-to-date 
   expect(await comicInfo(vol(1))).toContain('<Title>S Vol. 1 (Ch. 1–2)</Title>')
   expect(await chaptersIn(vol(1))).toEqual([1, 2])
   expect(readFileSync(vol(2)).equals(vol2)).toBe(true)
+})
+
+test('a volume retitled by hand in BookOrbit is not rewritten just for its title', async () => {
+  const { db, ctx, vol } = setup([1, 2].map(n => ch(n, n)), 2)
+  enqueue(db, 1, 'download')
+  await runNext(ctx)
+  await writeCbz(vol(1), [], { series: 'S', number: 1, title: 'Season one' })
+  const before = readFileSync(vol(1))
+  db.prepare(`update series set volumes_dirty = 1`).run()
+  enqueue(db, 1, 'restructure')
+  await runNext(ctx)
+  expect(readFileSync(vol(1)).equals(before)).toBe(true)
+})
+
+test('a CBZ that is not ours in the series folder is never read from, rewritten or deleted', async () => {
+  const { db, ctx, dir, vol } = setup([1, 2].map(n => ch(n, n)), 2)
+  enqueue(db, 1, 'download')
+  await runNext(ctx)
+  // e.g. a purchased volume BookOrbit grouped into the same folder; it even has a chapter-like folder
+  const stage = mkdtempSync(join(tmpdir(), 'mangarr-stage-'))
+  writeFileSync(join(stage, 'p'), 'scan')
+  await writeCbz(join(dir, 'Official Vol. 1', 'Official Vol. 1.cbz'), [{ name: '0001.0/001.jpg', path: join(stage, 'p') }, { name: 'credits.txt', path: join(stage, 'p') }] as AddFile[], { series: 'S', number: 1 })
+  const official = readFileSync(join(dir, 'Official Vol. 1', 'Official Vol. 1.cbz'))
+  db.prepare(`update chapters set volume = 2 where number = 2`).run()
+  enqueue(db, 1, 'restructure')
+  await runNext(ctx)
+  expect(await chaptersIn(vol(1))).toEqual([1])
+  expect(readFileSync(join(dir, 'Official Vol. 1', 'Official Vol. 1.cbz')).equals(official)).toBe(true)
 })

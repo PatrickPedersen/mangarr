@@ -3,6 +3,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { text } from 'node:stream/consumers'
 import yauzl from 'yauzl'
+import yazl from 'yazl'
+import { createWriteStream } from 'node:fs'
+import { finished } from 'node:stream/promises'
 import { expect, test } from 'vitest'
 import { cbzEntries, chapterDir, pageName, volumeName, writeCbz, type AddFile } from '../src/server/cbz.ts'
 
@@ -114,4 +117,57 @@ test('ComicInfo carries the volume number and title so BookOrbit orders volumes 
   expect(xml).toContain('<Series>S</Series>')
   expect(xml).toContain('<Number>2</Number>')
   expect(xml).toContain('<Title>Vol. 2 (Ch. 26–50)</Title>')
+})
+
+// A CBZ as BookOrbit leaves it after editing metadata: its fields in ComicInfo.xml, written in place.
+async function bookOrbitCbz(path: string, xml: string) {
+  const zip = new yazl.ZipFile()
+  zip.addBuffer(Buffer.from(xml), 'ComicInfo.xml')
+  zip.addBuffer(Buffer.from('c1p0'), '0001.0/001.webp')
+  zip.end()
+  await finished(zip.outputStream.pipe(createWriteStream(path)))
+}
+const edited = (title: string) => `<?xml version="1.0" encoding="utf-8"?>
+<ComicInfo>
+  <Title>${title}</Title>
+  <Series>S</Series>
+  <Number>1</Number>
+  <Summary>My own summary &amp; notes</Summary>
+  <Tags>favourite, reread</Tags>
+  <CommunityRating>4.5</CommunityRating>
+  <Notes>[BookOrbit]
+hardcoverId: 123</Notes>
+  <PageCount>1</PageCount>
+  <Pages>
+    <Page Image="0" Type="FrontCover" />
+  </Pages>
+</ComicInfo>
+`
+
+test("a rewrite keeps what BookOrbit wrote into ComicInfo.xml and only updates Mangarr's own fields", async () => {
+  const dir = lib()
+  const target = join(dir, 'S Vol. 1.cbz')
+  await bookOrbitCbz(target, edited('My favourite arc'))
+  await writeCbz(target, stage(join(dir, 'a'), [[2, 2]]), { series: 'Other', number: 1, title: 'S Vol. 1 (Ch. 1–2)', summary: 'From the source', genre: ['Action'] })
+  const xml = await read(target, 'ComicInfo.xml')
+  expect(xml).toContain('<Title>My favourite arc</Title>') // set by hand: kept
+  expect(xml).toContain('<Series>S</Series>') // present: kept
+  expect(xml).toContain('<Summary>My own summary &amp; notes</Summary>')
+  expect(xml).toContain('<Tags>favourite, reread</Tags>')
+  expect(xml).toContain('<CommunityRating>4.5</CommunityRating>')
+  expect(xml).toContain('hardcoverId: 123')
+  expect(xml).toContain('<PageCount>3</PageCount>') // always follows the pages
+  expect(xml).toContain('<Genre>Action</Genre>') // missing: added
+  expect(xml).not.toContain('<Pages>') // page indexes no longer valid
+  expect(xml.match(/<Title>/g)).toHaveLength(1)
+})
+
+test('a generated title is still updated', async () => {
+  const dir = lib()
+  const target = join(dir, 'S Vol. 1.cbz')
+  await bookOrbitCbz(target, edited('Vol. 1 (Ch. 1)'))
+  await writeCbz(target, [], { series: 'S', number: 1, title: 'S Vol. 1 (Ch. 1)' })
+  const xml = await read(target, 'ComicInfo.xml')
+  expect(xml).toContain('<Title>S Vol. 1 (Ch. 1)</Title>')
+  expect(xml).toContain('<Tags>favourite, reread</Tags>')
 })

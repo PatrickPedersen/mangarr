@@ -22,13 +22,36 @@ const isCover = (name: string) => name.startsWith('0000-cover.')
 
 const esc = (s: string) => s.replace(/[<>&'"]/g, c => `&#${c.charCodeAt(0)};`)
 
-function comicInfoXml(info: ComicInfo, pageCount: number) {
-  const tags: [string, string | null | undefined][] = [
-    ['Series', info.series], ['Number', info.number?.toString()], ['Title', info.title ?? info.series], ['Summary', info.summary], ['Writer', info.writer],
-    ['Genre', info.genre?.join(', ')], ['Web', info.web], ['PageCount', String(pageCount)], ['Manga', 'YesAndRightToLeft'],
+const unesc = (s: string) => s.replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n))).replace(/&(lt|gt|amp|quot|apos);/g, (_, e) => ({ lt: '<', gt: '>', amp: '&', quot: '"', apos: "'" })[e as 'lt'])
+
+/** Titles Mangarr generates ("Vol. 2 (Ch. 26–50)", with or without the series in front); anything else was set by hand. */
+export const isGeneratedTitle = (title: string) => /(^|\s)Vol\. \d+ \(Ch\. [^)]*\)$/.test(title)
+
+/**
+ * ComicInfo.xml for a rewritten CBZ. BookOrbit edits this file in place (title, summary, genres,
+ * ratings, its ids in Notes…), so an existing one is the starting point and only Mangarr's own
+ * fields change: Number and PageCount always (they follow the pages), Title while it's still a
+ * generated one, the rest only when missing. <Pages> is dropped: it describes pages by index,
+ * which a rewrite shifts. Hand-rolled because ComicInfo is flat; no XML library needed.
+ */
+function comicInfoXml(info: ComicInfo, pageCount: number, existing: string | null) {
+  const tags: [string, string | null | undefined, 'always' | 'generated' | 'missing'][] = [
+    ['Series', info.series, 'missing'], ['Number', info.number?.toString(), 'always'], ['Title', info.title ?? info.series, 'generated'],
+    ['Summary', info.summary, 'missing'], ['Writer', info.writer, 'missing'], ['Genre', info.genre?.join(', '), 'missing'],
+    ['Web', info.web, 'missing'], ['PageCount', String(pageCount), 'always'], ['Manga', 'YesAndRightToLeft', 'missing'],
   ]
-  const body = tags.filter(([, v]) => v).map(([k, v]) => `  <${k}>${esc(v!)}</${k}>`).join('\n')
-  return `<?xml version="1.0" encoding="utf-8"?>\n<ComicInfo>\n${body}\n</ComicInfo>\n`
+  const xml = existing?.includes('</ComicInfo>') ? existing : `<?xml version="1.0" encoding="utf-8"?>\n<ComicInfo>\n</ComicInfo>\n`
+  let out = xml.replace(/\s*<Pages\b[\s\S]*?<\/Pages>|\s*<Pages\s*\/>/, '')
+  for (const [k, v, when] of tags) {
+    if (!v) continue
+    const el = new RegExp(`<${k}>([\\s\\S]*?)</${k}>|<${k}\\s*/>`)
+    const current = out.match(el)
+    const now = current?.[1] === undefined ? null : unesc(current[1]).trim()
+    const set = when === 'always' || !now || (when === 'generated' && isGeneratedTitle(now))
+    if (!set) continue
+    out = current ? out.replace(el, `<${k}>${esc(v)}</${k}>`) : out.replace('</ComicInfo>', `  <${k}>${esc(v)}</${k}>\n</ComicInfo>`)
+  }
+  return out
 }
 
 const openZip = (path: string) =>
@@ -61,15 +84,17 @@ export async function writeCbz(target: string, add: AddFile[], info: ComicInfo, 
   }
 }
 
-type BuildOptions = { fresh?: boolean; drop?: Set<string>; from?: Source[] }
+type BuildOptions = { fresh?: boolean; drop?: Set<string>; from?: Source[]; infoFrom?: string }
 
 /**
  * The first half of writeCbz: builds the new archive and returns its temp path without touching
  * `target`, so several volumes can be built before any is replaced. The caller renames it, then cleanTmp().
  * fresh: don't start from `target`'s own entries. drop: chapter dirs (e.g. "0041.0") to leave out.
  * from: other CBZs to copy pages from; the first cover found is kept if `add` has none.
+ * infoFrom: the CBZ whose ComicInfo.xml (and so BookOrbit's edits) carries over; defaults to `target`.
  */
-export async function buildCbz(target: string, add: AddFile[], info: ComicInfo, { fresh = false, drop = new Set<string>(), from = [] }: BuildOptions = {}) {
+export async function buildCbz(target: string, add: AddFile[], info: ComicInfo, { fresh = false, drop = new Set<string>(), from = [], infoFrom = target }: BuildOptions = {}) {
+  const existingInfo = existsSync(infoFrom) ? await readComicInfo(infoFrom) : null
   const sources: Source[] = [...(!fresh && existsSync(target) ? [{ path: target, keep: () => true }] : []), ...from]
   const zips: yauzl.ZipFile[] = []
   try {
@@ -95,7 +120,7 @@ export async function buildCbz(target: string, add: AddFile[], info: ComicInfo, 
     items.sort((a, b) => (a.name < b.name ? -1 : 1))
 
     const zip = new yazl.ZipFile()
-    zip.addBuffer(Buffer.from(comicInfoXml(info, items.filter(i => isPage(i.name)).length)), 'ComicInfo.xml', { compress: false })
+    zip.addBuffer(Buffer.from(comicInfoXml(info, items.filter(i => isPage(i.name)).length, existingInfo)), 'ComicInfo.xml', { compress: false })
     // Images are already compressed: store them (no CPU, seek-friendly for readers).
     for (const item of items) {
       zip.addReadStreamLazy(item.name, { compress: false, size: item.size }, cb => item.open().then(s => cb(null, s), e => cb(e, undefined as never)))
@@ -133,18 +158,22 @@ export function cleanTmp(target: string) {
   try { rmdirSync(tmpDir) } catch {}
 }
 
-/** The <Title> in a CBZ's ComicInfo.xml, or null. */
-export async function comicInfoTitle(path: string) {
+/** A CBZ's ComicInfo.xml, or null if it has none. */
+export async function readComicInfo(path: string) {
   const zip = await openZip(path)
   try {
     const entry = (await listEntries(zip)).find(e => e.fileName === 'ComicInfo.xml')
     if (!entry) return null
-    const xml = await new Promise<string>((ok, fail) => zip.openReadStream(entry, (e, s) => (e ? fail(e) : text(s).then(ok, fail))))
-    const title = xml.match(/<Title>(.*?)<\/Title>/s)?.[1]
-    return title === undefined ? null : title.replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    return await new Promise<string>((ok, fail) => zip.openReadStream(entry, (e, s) => (e ? fail(e) : text(s).then(ok, fail))))
   } finally {
     zip.close()
   }
+}
+
+/** The <Title> in a CBZ's ComicInfo.xml, or null. */
+export async function comicInfoTitle(path: string) {
+  const title = (await readComicInfo(path))?.match(/<Title>([\s\S]*?)<\/Title>/)?.[1]
+  return title === undefined ? null : unesc(title).trim()
 }
 
 /** Entry names currently in a CBZ (used to verify and in tests). */
