@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { text } from 'node:stream/consumers'
@@ -6,8 +6,8 @@ import yauzl from 'yauzl'
 import yazl from 'yazl'
 import { createWriteStream } from 'node:fs'
 import { finished } from 'node:stream/promises'
-import { expect, test } from 'vitest'
-import { cbzEntries, chapterDir, pageName, volumeName, writeCbz, type AddFile } from '../src/server/cbz.ts'
+import { expect, test, vi } from 'vitest'
+import { cbzEntries, chapterDir, pageName, replaceCbz, volumeName, writeCbz, type AddFile } from '../src/server/cbz.ts'
 
 const lib = () => mkdtempSync(join(tmpdir(), 'mangarr-'))
 
@@ -170,4 +170,22 @@ test('a generated title is still updated', async () => {
   const xml = await read(target, 'ComicInfo.xml')
   expect(xml).toContain('<Title>S Vol. 1 (Ch. 1)</Title>')
   expect(xml).toContain('<Tags>favourite, reread</Tags>')
+})
+
+test('a replaced CBZ is touched again later, so a reader cache built during the swap goes stale', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mangarr-cbz-'))
+  const [tmp, target] = [join(dir, 'new.cbz'), join(dir, 'Vol. 1.cbz')]
+  writeFileSync(tmp, 'new')
+  const old = new Date('2020-01-01')
+  utimesSync(tmp, old, old)
+  vi.useFakeTimers()
+  try {
+    replaceCbz(tmp, target, 1000)
+    expect(statSync(target).mtimeMs).toBe(old.getTime())
+    vi.advanceTimersByTime(1000)
+    expect(statSync(target).mtimeMs).toBeGreaterThan(old.getTime())
+    expect(readFileSync(target, 'utf8')).toBe('new')
+  } finally {
+    vi.useRealTimers()
+  }
 })

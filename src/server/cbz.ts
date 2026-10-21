@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, renameSync, rmdirSync, rmSync, statSync } from 'node:fs'
+import { createReadStream, createWriteStream, existsSync, mkdirSync, renameSync, rmdirSync, rmSync, statSync, utimesSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import type { Readable } from 'node:stream'
@@ -78,10 +78,26 @@ export type Source = { path: string; keep: (chapterDir: string) => boolean }
 export async function writeCbz(target: string, add: AddFile[], info: ComicInfo, opts: BuildOptions = {}) {
   const tmp = await buildCbz(target, add, info, opts)
   try {
-    renameSync(tmp, target)
+    replaceCbz(tmp, target)
   } finally {
     cleanTmp(target)
   }
+}
+
+/**
+ * Renames a built CBZ over `target`, then touches it again a while later. BookOrbit caches a CBZ's page
+ * index keyed by mtime + size; a reader open during the swap can cache the old file's offsets under the new
+ * file's stamp (seen over NFS) and serve garbage pages until the stamp next changes. 90 s outlasts NFS's
+ * default 60 s attribute cache. ponytail: an in-process timer, lost if the pod restarts within that window.
+ */
+export function replaceCbz(tmp: string, target: string, delayMs = 90_000) {
+  renameSync(tmp, target)
+  setTimeout(() => {
+    try {
+      const now = new Date()
+      utimesSync(target, now, now)
+    } catch {} // moved or replaced since; whatever is there now has its own stamp
+  }, delayMs).unref()
 }
 
 type BuildOptions = { fresh?: boolean; drop?: Set<string>; from?: Source[]; infoFrom?: string }

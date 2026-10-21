@@ -5,7 +5,7 @@ import type { DatabaseSync } from 'node:sqlite'
 import * as suwayomi from './suwayomi.ts'
 import type { Notify } from './notify.ts'
 import { compareChapters, firstChapter, lastChapter } from './chapterOrder.ts'
-import { buildCbz, cbzEntries, chapterDir, cleanTmp, comicInfoTitle, isGeneratedTitle, readComicInfo, pageName, safeName, volumeName, writeCbz, type AddFile } from './cbz.ts'
+import { buildCbz, cbzEntries, chapterDir, cleanTmp, comicInfoTitle, isGeneratedTitle, readComicInfo, pageName, replaceCbz, safeName, volumeName, writeCbz, type AddFile } from './cbz.ts'
 
 export type Ctx = { db: DatabaseSync; sw: Pick<typeof suwayomi, 'manga' | 'pages' | 'image'>; libraryDir: string; notify: Notify }
 type Series = {
@@ -342,7 +342,7 @@ async function restructure({ db, sw }: Ctx, series: Series) {
       // Rename a volume only once every volume taking chapters from it is in place.
       const ready = [...pending].filter(t => ![...pending].some(u => u !== t && readsFrom.get(u)!.has(t)))
       for (const t of ready.length ? ready : [...pending]) {
-        renameSync(built.get(t)!, t)
+        replaceCbz(built.get(t)!, t)
         pending.delete(t)
       }
     }
