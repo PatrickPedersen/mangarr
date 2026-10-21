@@ -9,57 +9,69 @@ import type * as suwayomi from '../src/server/suwayomi.ts'
 function setup() {
   const lib = mkdtempSync(join(tmpdir(), 'mangarr-lib-'))
   const db = openDb(':memory:')
-  const file = join(lib, 'S.cbz')
-  db.prepare(`insert into series (title, suwayomi_manga_id, source_name, file_path) values ('S', 1, 'src', ?)`).run(file)
-  db.prepare(`insert into series (title, suwayomi_manga_id, source_name, file_path) values ('T', 2, 'src', ?)`).run(join(lib, 'T.cbz'))
+  const dir = join(lib, 'S')
+  db.prepare(`insert into series (title, suwayomi_manga_id, source_name, dir) values ('S', 1, 'src', ?)`).run(dir)
+  db.prepare(`insert into series (title, suwayomi_manga_id, source_name, dir) values ('T', 2, 'src', ?)`).run(join(lib, 'T'))
   const sw = {
     manga: async (id: number) => ({ manga: { id, title: 'S', thumbnailUrl: `/t/${id}`, source: { displayName: 'Other (EN)' } }, chapters: [] }),
   } as unknown as typeof suwayomi
   const app = api(db, lib, sw)
-  const patch = (filePath: unknown, id = 1) =>
-    app.request(`/series/${id}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ filePath }) })
-  const path = () => (db.prepare(`select file_path from series where id = 1`).get() as { file_path: string }).file_path
-  return { lib, db, file, patch, path }
+  const patch = (dir: unknown, id = 1) =>
+    app.request(`/series/${id}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ dir }) })
+  const path = () => (db.prepare(`select dir from series where id = 1`).get() as { dir: string }).dir
+  return { lib, db, dir, app, patch, path }
 }
 
-test('moves our CBZ to a new relative path inside the library', async () => {
-  const { lib, file, patch, path } = setup()
-  writeFileSync(file, 'cbz')
-  const res = await patch('Author/S/S.cbz')
+test('moves our series folder to a new relative path inside the library', async () => {
+  const { lib, dir, patch, path } = setup()
+  mkdirSync(dir)
+  writeFileSync(join(dir, 'S Vol. 01.cbz'), 'cbz')
+  const res = await patch('Author/S')
   expect(res.status).toBe(200)
   expect(await res.json()).toMatchObject({ moved: true })
-  expect(path()).toBe(join(lib, 'Author/S/S.cbz'))
-  expect(existsSync(file)).toBe(false)
-  expect(existsSync(join(lib, 'Author/S/S.cbz'))).toBe(true)
+  expect(path()).toBe(join(lib, 'Author/S'))
+  expect(existsSync(dir)).toBe(false)
+  expect(existsSync(join(lib, 'Author/S/S Vol. 01.cbz'))).toBe(true)
 })
 
-test('adopts a file that is already at the new path (moved by BookOrbit)', async () => {
+test('adopts a folder that is already at the new path (moved by BookOrbit)', async () => {
   const { lib, patch, path } = setup()
   mkdirSync(join(lib, 'Author/S'), { recursive: true })
-  writeFileSync(join(lib, 'Author/S/S.cbz'), 'moved')
-  const res = await patch(join(lib, 'Author/S/S.cbz'))
+  const res = await patch(join(lib, 'Author/S'))
   expect(await res.json()).toMatchObject({ moved: false })
-  expect(path()).toBe(join(lib, 'Author/S/S.cbz'))
+  expect(path()).toBe(join(lib, 'Author/S'))
 })
 
 test.each([
-  ['../outside.cbz', 400],
-  ['/etc/passwd.cbz', 400],
-  ['.mangarr-tmp/S.cbz', 400],
-  ['S.zip', 400],
+  ['../outside', 400],
+  ['/etc', 400],
+  ['.mangarr-tmp/S', 400],
+  ['S/S Vol. 01.cbz', 400],
   ['', 400],
   [42, 400],
-  ['T.cbz', 409],
-])('rejects %j with %i', async (filePath, status) => {
-  const { patch, path, file } = setup()
-  expect((await patch(filePath)).status).toBe(status)
-  expect(path()).toBe(file)
+  ['T', 409],
+])('rejects %j with %i', async (dir, status) => {
+  const { patch, path, dir: before } = setup()
+  expect((await patch(dir)).status).toBe(status)
+  expect(path()).toBe(before)
 })
 
 test('refuses while a download is running for the series', async () => {
   const { db, patch } = setup()
   db.prepare(`insert into jobs (series_id, kind, state) values (1, 'download', 'running')`).run()
-  expect((await patch('New.cbz')).status).toBe(409)
+  expect((await patch('New')).status).toBe(409)
+})
+
+test('adding a series gives it its own folder and refuses a folder that already exists', async () => {
+  const { lib, db, app } = setup()
+  db.prepare(`delete from series`).run()
+  const add = () => app.request('/series', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mangaId: 5 }) })
+  expect((await add()).status).toBe(201)
+  expect(db.prepare(`select dir from series`).get()).toEqual({ dir: join(lib, 'S') })
+  expect((await add()).status).toBe(409) // already tracked
+  db.prepare(`delete from series`).run()
+  mkdirSync(join(lib, 'S'))
+  expect((await add()).status).toBe(409) // someone else's folder
 })
 
 test('switching source records the resume point and queues a check', async () => {

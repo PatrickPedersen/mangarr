@@ -9,14 +9,14 @@ Source of intent: [docs/intent/mangarr.md](docs/intent/mangarr.md)
 3. Suwayomi (headless) handles every source-specific concern: extensions, Cloudflare via the existing `flaresolverr` in `media`, and rate limits. Mangarr never talks to a scanlation site directly.
 4. Mangarr writes to the same `media` NFS PVC (RWX) that BookOrbit mounts at `/books`, using the same uid/gid (100000).
 5. Notifications go to Gotify (`POST /message` with an application token). If Gotify isn't configured, they are only logged.
-6. Files are flat: `<library>/<Title>.cbz`. A folder per series only adds value for sidecar files, and there are none.
+6. ~~Files are flat: `<library>/<Title>.cbz`.~~ Superseded by **Volumes** below: one folder per series, holding volume CBZs.
 7. Mangarr is licensed AGPL-3.0, so BookOrbit's UI components and design tokens can be copied directly.
 8. Reading happens only in BookOrbit's web reader. There's no KOReader or Kobo, so the file-hash progress matching doesn't apply.
 9. Temp files go in `<library>/.mangarr-tmp/`. BookOrbit's scan walk and file watcher both skip any path segment that starts with `.` (`scanner/lib/walk.ts`, `scanner/file-watcher.service.ts`).
 
 ## Objective
 
-A self-hosted, Sonarr-style service that keeps exactly **one CBZ per series** in a BookOrbit library up to date.
+A self-hosted, Sonarr-style service that keeps a series' CBZs in a BookOrbit library up to date. Originally one CBZ per series; since TBATE (18k pages, no chapter navigation in BookOrbit's reader) a series is split into **volumes**, see below.
 
 User stories:
 - I search across my Suwayomi sources and add a series. Mangarr downloads every chapter into `<library>/<Series Title>.cbz`.
@@ -73,6 +73,20 @@ ComicInfo.xml
 0001.5/001.webp     ← decimal chapters supported
 0012.0/014.webp
 ```
+
+## Volumes (v0.2)
+
+Why: BookOrbit's CBZ reader has no chapter navigation, so one 18,000-page book is unreadable. BookOrbit does group books by `ComicInfo.xml` `Series` + `Number` and offers "next book" in the reader, so volumes read as one series.
+
+- **Layout:** `<library>/<Series Title>/<Series Title> Vol. 01.cbz`, `Vol. 02`, … (3-digit padding past 99). The series' path setting now points at the folder; moving it moves every volume. Inside each volume the CBZ layout is unchanged.
+- **ComicInfo + cover:** `Series` = series title, `Number` = volume number, `Title` = `Vol. N (Ch. a–b)`. Every volume carries the series cover as `0000-cover`, so BookOrbit shows it instead of a random first page.
+- **Assignment:** every chapter row has a `volume`. A new chapter goes into the last volume while it holds fewer than `volume_size` chapters (default **25**, per series), otherwise it starts the next volume.
+- **Boundaries:** on the series page, chapters are grouped by volume. Any chapter can **start a volume here**; the first chapter of a volume can **merge into the previous**. **Re-split** reassigns every chapter by the current `volume_size`. Changes queue a `restructure` job.
+- **Restructure:** the new volume files are streamed straight from the old CBZs' entries (no re-download, no extraction to disk), each via temp file + rename. Old files that no longer correspond to a volume are deleted only after every new volume has been written. Peak extra disk = the size of the rewritten volumes.
+- **Migration:** existing single-CBZ series are restructured into volumes on first start of v0.2, the same way. The old single file is deleted after its volumes exist.
+- **BookOrbit effects:** a migrated series appears as new books (progress on the old single book is lost). A volume rewritten by a boundary change keeps its path, so BookOrbit keeps the book, but page positions shift.
+
+Data model changes: `series.dir` (replaces `file_path`), `series.volume_size integer default 25`, `chapters.volume integer`, job kind `restructure`.
 
 ## Commands
 
@@ -143,12 +157,13 @@ export function missingChapters(remote: Chapter[], have: Set<number>): Chapter[]
 
 ## Success Criteria
 
-1. Adding a 50-chapter series produces one valid CBZ that BookOrbit imports as a single book, with title and cover.
+1. Adding a 50-chapter series produces volume CBZs (2 at the default size) that BookOrbit imports as one series, in order, with title and cover.
 2. When a new chapter shows up on the source, the next check appends it. BookOrbit shows the updated page count, keeps the same book entry, and keeps web-reader progress.
 3. Killing the pod mid-download leaves the previous CBZ intact, and the job retries on restart.
 4. A source that errors marks the series as failing and sends exactly one Gotify message.
 5. Switching sources downloads only chapters numbered above the current max.
 6. The UI matches BookOrbit visually: same fonts, palette, cover grid and sidebar layout.
+7. Setting a volume boundary on the series page rewrites only the affected volumes, and BookOrbit shows the new split. Migrating TBATE's single 5.5GB CBZ produces its volumes without re-downloading.
 
 ## Open Questions
 

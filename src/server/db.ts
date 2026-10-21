@@ -1,3 +1,4 @@
+import { basename, dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
 const schema = `
@@ -11,7 +12,9 @@ create table if not exists series (
   last_checked_at text,
   last_error text,
   resume_after real, -- set on source switch: only chapters above this come from the new source
-  file_path text not null unique,
+  dir text not null unique, -- folder holding the series' volume CBZs
+  volume_size integer not null default 25, -- chapters per volume when a new one is started
+  legacy_file text, -- pre-volumes single CBZ, waiting to be split into volumes
   added_at text not null default (datetime('now'))
 );
 create table if not exists chapters (
@@ -22,6 +25,8 @@ create table if not exists chapters (
   suwayomi_chapter_id integer not null,
   removed integer not null default 0, -- dropped from the CBZ by the user; never re-fetched
   warning text, -- set when the page count looks off for this series
+  volume integer, -- null only for chapters still in a legacy single CBZ
+  pages integer,
   downloaded_at text not null default (datetime('now')),
   unique (series_id, number)
 );
@@ -46,5 +51,38 @@ export function openDb(path: string) {
   add('series', 'resume_after', 'real')
   add('chapters', 'removed', 'integer not null default 0')
   add('chapters', 'warning', 'text')
+  add('chapters', 'volume', 'integer')
+  add('chapters', 'pages', 'integer')
+  if (cols('series').includes('file_path')) toVolumes(db)
   return db
+}
+
+/**
+ * v0.1 → v0.2: `file_path` (one CBZ) becomes `dir` (a folder of volumes); the old file is kept as
+ * `legacy_file` until the worker has split it. SQLite can't drop a NOT NULL UNIQUE column, so the
+ * table is rebuilt; foreign keys are off meanwhile or dropping `series` would cascade to chapters.
+ */
+function toVolumes(db: DatabaseSync) {
+  // "<lib>/S/S.cbz" (already in its own folder) → "<lib>/S"; "<lib>/S.cbz" → "<lib>/S".
+  const dirFor = (file: string) => {
+    const stem = basename(file).replace(/\.cbz$/i, '')
+    return basename(dirname(file)) === stem ? dirname(file) : file.replace(/\.cbz$/i, '')
+  }
+  const rows = db.prepare(`select * from series`).all() as Record<string, string | number | null>[]
+  db.exec('pragma foreign_keys = off; begin')
+  try {
+    // New table first, then rename: renaming the old one would repoint chapters' foreign key at it.
+    db.exec(schema.slice(0, schema.indexOf(');') + 2).replace('series (', 'series_v2 ('))
+    const ins = db.prepare(`insert into series_v2 (id, title, suwayomi_manga_id, source_name, cover_url, status, last_checked_at, last_error, resume_after, dir, legacy_file, added_at)
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    for (const r of rows) {
+      ins.run(r.id, r.title, r.suwayomi_manga_id, r.source_name, r.cover_url, r.status, r.last_checked_at, r.last_error, r.resume_after, dirFor(String(r.file_path)), r.file_path, r.added_at)
+    }
+    db.exec(`drop table series; alter table series_v2 rename to series; commit`)
+  } catch (e) {
+    db.exec('rollback')
+    throw e
+  } finally {
+    db.exec('pragma foreign_keys = on')
+  }
 }

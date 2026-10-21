@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { text } from 'node:stream/consumers'
 import yauzl from 'yauzl'
 import { expect, test } from 'vitest'
-import { cbzEntries, cbzName, chapterDir, pageName, writeCbz, type AddFile } from '../src/server/cbz.ts'
+import { cbzEntries, chapterDir, pageName, volumeName, writeCbz, type AddFile } from '../src/server/cbz.ts'
 
 const lib = () => mkdtempSync(join(tmpdir(), 'mangarr-'))
 
@@ -102,6 +102,17 @@ test('a failed write leaves the original byte-identical and no temp file behind'
   expect(existsSync(join(dir, '.mangarr-tmp', 'S.cbz'))).toBe(false)
 })
 
-test('cbzName strips path and reserved characters', () => {
-  expect(cbzName('Solo Leveling: Ragnarok / Part 2?')).toBe('Solo Leveling Ragnarok Part 2.cbz')
+test('volumeName strips path and reserved characters and pads the volume', () => {
+  expect(volumeName('Solo Leveling: Ragnarok / Part 2?', 3)).toBe('Solo Leveling Ragnarok Part 2 Vol. 03.cbz')
+  expect(volumeName('S', 120)).toBe('S Vol. 120.cbz')
+})
+
+test('ComicInfo carries the volume number and title so BookOrbit orders volumes as one series', async () => {
+  const dir = lib()
+  const target = join(dir, 'S Vol. 02.cbz')
+  await writeCbz(target, stage(join(dir, 'a'), [[26, 1]]), { series: 'S', number: 2, title: 'Vol. 2 (Ch. 26–50)' })
+  const xml = await read(target, 'ComicInfo.xml')
+  expect(xml).toContain('<Series>S</Series>')
+  expect(xml).toContain('<Number>2</Number>')
+  expect(xml).toContain('<Title>Vol. 2 (Ch. 26–50)</Title>')
 })

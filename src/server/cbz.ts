@@ -7,7 +7,7 @@ import yazl from 'yazl'
 
 /** A new archive entry whose bytes are in a file on disk (staged pages, cover). */
 export type AddFile = { name: string; path: string }
-export type ComicInfo = { series: string; summary?: string | null; writer?: string | null; genre?: string[]; web?: string | null }
+export type ComicInfo = { series: string; number?: number; title?: string; summary?: string | null; writer?: string | null; genre?: string[]; web?: string | null }
 
 // 1 → "0001.0", 12.5 → "0012.5": lexical order == reading order. Extra decimals (10.25) keep their digits.
 export const chapterDir = (n: number) => {
@@ -23,7 +23,7 @@ const esc = (s: string) => s.replace(/[<>&'"]/g, c => `&#${c.charCodeAt(0)};`)
 
 function comicInfoXml(info: ComicInfo, pageCount: number) {
   const tags: [string, string | null | undefined][] = [
-    ['Series', info.series], ['Title', info.series], ['Summary', info.summary], ['Writer', info.writer],
+    ['Series', info.series], ['Number', info.number?.toString()], ['Title', info.title ?? info.series], ['Summary', info.summary], ['Writer', info.writer],
     ['Genre', info.genre?.join(', ')], ['Web', info.web], ['PageCount', String(pageCount)], ['Manga', 'YesAndRightToLeft'],
   ]
   const body = tags.filter(([, v]) => v).map(([k, v]) => `  <${k}>${esc(v!)}</${k}>`).join('\n')
@@ -122,5 +122,6 @@ export async function cbzEntries(path: string) {
   }
 }
 
-// Filesystem-safe and stable, so the same title always maps to the same file.
-export const cbzName = (title: string) => title.replace(/[\/\\:*?"<>|]/g, '').replace(/\s+/g, ' ').trim() + '.cbz'
+// Filesystem-safe and stable, so the same title always maps to the same folder and files.
+export const safeName = (title: string) => title.replace(/[\/\\:*?"<>|]/g, '').replace(/\s+/g, ' ').trim()
+export const volumeName = (title: string, volume: number) => `${safeName(title)} Vol. ${String(volume).padStart(2, '0')}.cbz`

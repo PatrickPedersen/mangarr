@@ -32,7 +32,8 @@ export type Series = {
 
 export type Job = { id: number; kind: string; state: 'queued' | 'running' | 'done' | 'failed'; error: string | null; created_at: string; finished_at: string | null }
 export type SeriesDetail = Omit<Series, 'chapter_count' | 'latest_chapter' | 'job_state'> & {
-  file_path: string
+  dir: string
+  volume_size: number
   added_at: string
   chapters: { number: number; title: string | null; downloaded_at: string; removed: number; warning: string | null }[]
   jobs: Job[]

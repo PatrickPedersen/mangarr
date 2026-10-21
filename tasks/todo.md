@@ -87,11 +87,28 @@ Verification commands: `pnpm test`, `pnpm build`.
   - Files: `Dockerfile`, `.dockerignore`, `.github/workflows/image.yaml`
   - Deps: T9 · Size: S
 
-- [ ] **T11: Deploy Mangarr to home-ops**
+- [x] **T11: Deploy Mangarr to home-ops**
   - Acceptance: `kubernetes/apps/media/mangarr/` set up as in the spec: config PVC with volsync, the `media` PVC at `/books` with subPath books, `LIBRARY_DIR=/books/manhwa`, `SUWAYOMI_URL` in-cluster, `GOTIFY_URL` + `GOTIFY_TOKEN` from ExternalSecret (1Password item `kubernetes/mangarr`, fields GOTIFY_URL / GOTIFY_TOKEN), a route on envoy-external, and the HTTPRoute added to `forward-auth.yaml`. The image is pinned by digest.
   - Verify: `flux get ks mangarr` is Ready. Opening the hostname goes through Authentik. Add a series, and it shows up in BookOrbit. Success Criterion 3: kill the pod mid-download, the old CBZ is intact, and the job resumes.
   - Files: `mangarr/ks.yaml`, `mangarr/app/{helmrelease,externalsecret,kustomization}.yaml`, `media/kustomization.yaml`, `media/forward-auth.yaml`
   - Deps: T10 · Size: S
 
+### Phase 5: Volumes (v0.2)
+
+- [x] **T12: Volume CBZs**
+  - Acceptance: schema gets `series.dir`, `series.volume_size` (default 25), `chapters.volume`. Downloads assign chapters to volumes and write `<dir>/<Title> Vol. NN.cbz` with ComicInfo `Series`/`Number`/`Title`. Only volumes that got new chapters (or dropped removed ones) are rewritten. Rebuild writes all volumes fresh.
+  - Verify: worker + cbz tests (assignment incl. auto-start at size, append to last volume, removed chapters), `pnpm test`, manual add of a 30-chapter series → Vol. 01 (25) + Vol. 02 (5).
+  - Files: `db.ts`, `worker.ts`, `cbz.ts`, tests · Size: M
+
+- [ ] **T13: Restructure + migration**
+  - Acceptance: `writeCbz` can take entries from several source CBZs. A `restructure` job rewrites volumes whose chapter set changed, streaming from the old files, then deletes obsolete files. On start, single-file series are migrated (old file deleted only after all volumes exist). API: `PUT /series/:id/volumes` (`{ starts: number[] }` or `{ size }` + re-split), validated; path change moves the folder.
+  - Verify: tests for split/merge/migrate (original intact on failure, no entry lost or duplicated), `pnpm test`; manual: migrate a dev copy of VS, then TBATE in the cluster.
+  - Files: `cbz.ts`, `worker.ts`, `api.ts`, `main.ts`, tests · Size: M
+
+- [ ] **T14: Volume UI**
+  - Acceptance: series page groups chapters by volume (header: volume, chapter range, page count), per-row "Start volume here", per-volume "Merge into previous", volume size input + "Re-split", library card shows volume count.
+  - Verify: `pnpm typecheck`, `pnpm build`, manual check in the browser.
+  - Files: `pages/Series.vue`, `lib/api.ts`, `pages/Library.vue` · Size: S
+
 ### Checkpoint: Complete
-- [ ] All 6 spec Success Criteria met
+- [ ] All 7 spec Success Criteria met

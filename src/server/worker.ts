@@ -4,12 +4,12 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import type { DatabaseSync } from 'node:sqlite'
 import * as suwayomi from './suwayomi.ts'
 import type { Notify } from './notify.ts'
-import { cbzEntries, chapterDir, pageName, writeCbz, type AddFile } from './cbz.ts'
+import { cbzEntries, chapterDir, pageName, safeName, volumeName, writeCbz, type AddFile } from './cbz.ts'
 
 export type Ctx = { db: DatabaseSync; sw: Pick<typeof suwayomi, 'manga' | 'pages' | 'image'>; libraryDir: string; notify: Notify }
 type Series = {
-  id: number; title: string; source_name: string; status: 'ok' | 'failing'; suwayomi_manga_id: number; file_path: string
-  resume_after: number | null
+  id: number; title: string; source_name: string; status: 'ok' | 'failing'; suwayomi_manga_id: number
+  dir: string; volume_size: number; legacy_file: string | null; resume_after: number | null
 }
 type JobKind = 'check' | 'download' | 'rebuild'
 
@@ -48,21 +48,53 @@ export function pageCountWarnings(baseline: number[], fresh: Map<number, number>
 }
 
 /**
+ * Volume per new chapter. Chapters past the current last one fill the last volume up to `size`,
+ * then start the next. A late chapter that sorts before the last (12.5 posted after 13) joins the
+ * volume of the chapter just before it.
+ */
+export function assignVolumes(have: { number: number; volume: number }[], add: number[], size: number) {
+  const sorted = [...have].sort((a, b) => a.number - b.number)
+  const max = sorted.at(-1)?.number ?? -Infinity
+  let last = Math.max(1, ...have.map(h => h.volume))
+  let count = have.filter(h => h.volume === last).length
+  const out = new Map<number, number>()
+  for (const n of add) {
+    if (n < max) {
+      out.set(n, (sorted.findLast(h => h.number < n) ?? sorted[0]!).volume)
+      continue
+    }
+    if (count >= size) [last, count] = [last + 1, 0]
+    out.set(n, last)
+    count++
+  }
+  return out
+}
+
+const range = (nums: number[]) => {
+  const [lo, hi] = [Math.min(...nums), Math.max(...nums)]
+  return lo === hi ? `Ch. ${lo}` : `Ch. ${lo}–${hi}`
+}
+
+/**
  * Pages are staged on disk (in the library's dot-dir, which BookOrbit ignores) and the CBZ is
- * rebuilt once at the end. A chapter counts as staged once its `.done` marker exists, so a job
+ * rebuilt once at the end: each volume that got chapters (or lost removed ones) is rewritten once. A chapter counts as staged once its `.done` marker exists, so a job
  * that dies halfway resumes without re-fetching, and memory never holds more than one page.
- * `fresh` (Redownload all) ignores what we have and replaces the CBZ wholesale.
+ * `fresh` (Redownload all) ignores what we have and rewrites every volume, re-split by volume size.
  * Chapters marked removed are dropped from the CBZ here and never fetched again, not even by `fresh`.
  */
 async function download({ db, sw, libraryDir, notify }: Ctx, series: Series, fresh: boolean) {
+  // ponytail: T13 splits these; until then they are left alone.
+  if (series.legacy_file) throw new Error('this series is still a single CBZ, waiting to be split into volumes')
   const { manga, chapters } = await sw.manga(series.suwayomi_manga_id)
-  const rows = db.prepare(`select number, removed from chapters where series_id = ?`).all(series.id) as { number: number; removed: number }[]
-  const removed = rows.filter(r => r.removed).map(r => r.number)
+  const rows = db.prepare(`select number, removed, volume, pages from chapters where series_id = ?`).all(series.id) as {
+    number: number; removed: number; volume: number; pages: number | null
+  }[]
+  const removed = rows.filter(r => r.removed)
   const kept = rows.filter(r => !r.removed)
-  const have = new Set(fresh ? removed : rows.map(r => r.number))
-  // Never start a fresh CBZ for a series that already has one: it was moved (e.g. by BookOrbit) or deleted.
-  if (!fresh && kept.length > 0 && !existsSync(series.file_path)) {
-    throw new Error(`CBZ not found at ${series.file_path}. If it was moved, update the path on the series page.`)
+  const have = new Set(fresh ? removed.map(r => r.number) : rows.map(r => r.number))
+  // Never start fresh volumes for a series that already has some: it was moved (e.g. by BookOrbit) or deleted.
+  if (!fresh && kept.length > 0 && !existsSync(series.dir)) {
+    throw new Error(`folder not found at ${series.dir}. If it was moved, update the path on the series page.`)
   }
   // A source that suddenly lists nothing has usually removed the series or is serving a block page.
   if (kept.length > 0 && chapters.length === 0) throw new Error('source returned no chapters (series removed, or the site is blocking us?)')
@@ -77,14 +109,26 @@ async function download({ db, sw, libraryDir, notify }: Ctx, series: Series, fre
   }
   if ((fresh || kept.length === 0) && todo.length === 0) throw new Error('source returned no downloadable chapters')
 
-  const drop = new Set(removed.map(chapterDir))
-  const existing = !fresh && existsSync(series.file_path) ? await cbzEntries(series.file_path) : []
-  const needsDrop = existing.some(n => drop.has(n.split('/')[0]!))
-  if (todo.length === 0 && !needsDrop) return touch(db, series.id)
+  const base = fresh ? [] : kept
+  const volumeOf = assignVolumes(base, todo.map(c => c.chapterNumber), series.volume_size)
+  const path = (v: number) => join(series.dir, volumeName(series.title, v))
+  const drop = new Set(removed.map(r => chapterDir(r.number)))
+  const targets = new Set(volumeOf.values())
+  if (!fresh) {
+    for (const v of new Set(removed.map(r => r.volume))) {
+      if (existsSync(path(v)) && (await cbzEntries(path(v))).some(n => drop.has(n.split('/')[0]!))) targets.add(v)
+    }
+  }
+  if (targets.size === 0) return touch(db, series.id)
+  for (const v of targets) {
+    if (!fresh && kept.some(r => r.volume === v) && !existsSync(path(v))) {
+      throw new Error(`${path(v)} not found. If the series was moved, update the path on the series page.`)
+    }
+  }
 
   // Keyed by id under the library root, so changing the series' path doesn't orphan staged pages.
   const stage = join(libraryDir, '.mangarr-tmp', `series-${series.id}`)
-  const add: AddFile[] = []
+  const add = new Map<number, AddFile[]>()
   const newCounts = new Map<number, number>()
   for (const ch of todo) {
     const dir = join(stage, chapterDir(ch.chapterNumber))
@@ -107,31 +151,47 @@ async function download({ db, sw, libraryDir, notify }: Ctx, series: Series, fre
       writeFileSync(join(dir, '.done'), '')
     }
     const pages = readdirSync(dir).filter(f => !f.startsWith('.') && !f.endsWith('.part'))
-    for (const f of pages) add.push({ name: `${chapterDir(ch.chapterNumber)}/${f}`, path: join(dir, f) })
+    const v = volumeOf.get(ch.chapterNumber)!
+    add.set(v, [...(add.get(v) ?? []), ...pages.map(f => ({ name: `${chapterDir(ch.chapterNumber)}/${f}`, path: join(dir, f) }))])
     newCounts.set(ch.chapterNumber, pages.length)
   }
-  if ((fresh || kept.length === 0) && manga.thumbnailUrl) {
+  // Every volume carries the series cover, so BookOrbit doesn't pick a random first page.
+  const needsCover = [...targets].filter(v => fresh || !existsSync(path(v)))
+  if (needsCover.length && manga.thumbnailUrl) {
     const { data, ext } = await sw.image(manga.thumbnailUrl)
     writeFileSync(join(stage, `0000-cover.${ext}`), data)
-    add.push({ name: `0000-cover.${ext}`, path: join(stage, `0000-cover.${ext}`) })
+    for (const v of needsCover) add.set(v, [...(add.get(v) ?? []), { name: `0000-cover.${ext}`, path: join(stage, `0000-cover.${ext}`) }])
   }
 
-  // Baseline = pages per chapter already in the CBZ (minus removed ones).
-  const perDir = new Map<string, number>()
-  for (const n of existing) if (n.includes('/') && !drop.has(n.split('/')[0]!)) perDir.set(n.split('/')[0]!, (perDir.get(n.split('/')[0]!) ?? 0) + 1)
-  const warnings = pageCountWarnings([...perDir.values()], newCounts)
-
-  const info = { series: manga.title, summary: manga.description, writer: manga.author, genre: manga.genre, web: manga.realUrl }
-  await writeCbz(series.file_path, add, info, { fresh, drop })
-  // Recorded after the rename: a crash in between re-adds the same staged entries next time, which is harmless.
+  const warnings = pageCountWarnings(base.flatMap(r => (r.pages === null ? [] : [r.pages])), newCounts)
+  const after = [...base, ...todo.map(c => ({ number: c.chapterNumber, volume: volumeOf.get(c.chapterNumber)! }))]
+  // Series title from our record, not the source: a source switch must not split the series in BookOrbit.
+  const info = { series: series.title, summary: manga.description, writer: manga.author, genre: manga.genre, web: manga.realUrl }
+  mkdirSync(series.dir, { recursive: true })
+  for (const v of [...targets].sort((a, b) => a - b)) {
+    const title = `Vol. ${v} (${range(after.filter(c => c.volume === v).map(c => c.number))})`
+    await writeCbz(path(v), add.get(v) ?? [], { ...info, number: v, title }, { fresh, drop })
+  }
+  if (fresh) {
+    // Volumes past the new last one (the source has fewer chapters now) are gone; their replacements exist.
+    const lastVolume = Math.max(...targets)
+    const prefix = `${safeName(series.title)} Vol. `
+    for (const f of readdirSync(series.dir)) {
+      if (f.startsWith(prefix) && f.endsWith('.cbz') && Number(f.slice(prefix.length, -4)) > lastVolume) rmSync(join(series.dir, f))
+    }
+  }
+  // Recorded after the renames: a crash in between re-adds the same staged entries next time, which is harmless.
   db.exec('begin')
   try {
     if (fresh) {
       db.prepare(`delete from chapters where series_id = ? and removed = 0`).run(series.id)
       db.prepare(`update series set resume_after = null where id = ?`).run(series.id)
     }
-    const ins = db.prepare(`insert or ignore into chapters (series_id, number, title, suwayomi_chapter_id, warning) values (?, ?, ?, ?, ?)`)
-    for (const ch of todo) ins.run(series.id, ch.chapterNumber, ch.name, ch.id, warnings.get(ch.chapterNumber) ?? null)
+    const ins = db.prepare(`insert or ignore into chapters (series_id, number, title, suwayomi_chapter_id, warning, volume, pages) values (?, ?, ?, ?, ?, ?, ?)`)
+    for (const ch of todo) {
+      const n = ch.chapterNumber
+      ins.run(series.id, n, ch.name, ch.id, warnings.get(n) ?? null, volumeOf.get(n)!, newCounts.get(n)!)
+    }
     db.exec('commit')
   } catch (e) {
     db.exec('rollback')

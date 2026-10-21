@@ -1,18 +1,23 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
+import yauzl from 'yauzl'
+import { text } from 'node:stream/consumers'
 import { cbzEntries } from '../src/server/cbz.ts'
 import { expect, test, vi } from 'vitest'
 import { openDb } from '../src/server/db.ts'
-import { enqueue, missingChapters, pageCountWarnings, runNext, scheduleChecks, type Ctx } from '../src/server/worker.ts'
+import { assignVolumes, enqueue, missingChapters, pageCountWarnings, runNext, scheduleChecks, type Ctx } from '../src/server/worker.ts'
 import type { Chapter } from '../src/server/suwayomi.ts'
 
 const ch = (id: number, chapterNumber: number, sourceOrder = id): Chapter => ({ id, name: `Ch ${chapterNumber}`, chapterNumber, sourceOrder })
 
-function setup(chapters: Chapter[]) {
+function setup(chapters: Chapter[], volumeSize = 25) {
   const db = openDb(':memory:')
-  const file = join(mkdtempSync(join(tmpdir(), 'mangarr-')), 'S.cbz')
-  db.prepare(`insert into series (title, suwayomi_manga_id, source_name, file_path) values ('S', 7, 'src', ?)`).run(file)
+  const lib = mkdtempSync(join(tmpdir(), 'mangarr-'))
+  const dir = join(lib, 'S')
+  const vol = (n: number) => join(dir, `S Vol. ${String(n).padStart(2, '0')}.cbz`)
+  const file = vol(1)
+  db.prepare(`insert into series (title, suwayomi_manga_id, source_name, dir, volume_size) values ('S', 7, 'src', ?, ?)`).run(dir, volumeSize)
   const sw = {
     manga: vi.fn(async () => ({
       manga: { id: 7, title: 'S', thumbnailUrl: '/thumb', description: null, author: null, artist: null, genre: [], status: '', realUrl: null, source: { displayName: 'src' } },
@@ -22,11 +27,11 @@ function setup(chapters: Chapter[]) {
     image: vi.fn(async (path: string) => ({ data: new TextEncoder().encode(path), ext: 'jpg' })),
   }
   const notify = vi.fn(async (_title: string, _message: string) => {})
-  const ctx: Ctx = { db, sw, libraryDir: dirname(file), notify }
+  const ctx: Ctx = { db, sw, libraryDir: lib, notify }
   const rows = () => db.prepare(`select number from chapters order by number`).all().map(r => (r as { number: number }).number)
   const job = () => db.prepare(`select state, error from jobs order by id desc limit 1`).get() as { state: string; error: string | null }
   const status = () => (db.prepare(`select status from series where id = 1`).get() as { status: string }).status
-  return { db, file, sw, ctx, rows, job, notify, status }
+  return { db, dir, vol, file, sw, ctx, rows, job, notify, status }
 }
 
 test('missingChapters skips known, unparsed (-1) and duplicate numbers, sorted', () => {
@@ -53,7 +58,7 @@ test('download job writes every chapter + cover and records them', async () => {
   expect(job().state).toBe('done')
   expect(rows()).toEqual([1, 2, 2.5])
   expect(await cbzEntries(file)).toEqual(['ComicInfo.xml', '0000-cover.jpg', '0001.0/001.jpg', '0001.0/002.jpg', '0002.0/001.jpg', '0002.0/002.jpg', '0002.5/001.jpg', '0002.5/002.jpg'])
-  expect(existsSync(join(dirname(file), '.mangarr-tmp', 'series-1'))).toBe(false)
+  expect(existsSync(join(ctx.libraryDir, '.mangarr-tmp', 'series-1'))).toBe(false)
   expect(await runNext(ctx)).toBe(false)
 })
 
@@ -109,8 +114,8 @@ test('enqueue does not stack queued jobs for one series', () => {
 
 test('scheduleChecks queues never-checked and stale series only', () => {
   const { db } = setup([])
-  db.prepare(`insert into series (title, suwayomi_manga_id, source_name, file_path, last_checked_at) values ('Fresh', 8, 'src', '/f.cbz', datetime('now', '-1 hours'))`).run()
-  db.prepare(`insert into series (title, suwayomi_manga_id, source_name, file_path, last_checked_at) values ('Stale', 9, 'src', '/s.cbz', datetime('now', '-25 hours'))`).run()
+  db.prepare(`insert into series (title, suwayomi_manga_id, source_name, dir, last_checked_at) values ('Fresh', 8, 'src', '/f', datetime('now', '-1 hours'))`).run()
+  db.prepare(`insert into series (title, suwayomi_manga_id, source_name, dir, last_checked_at) values ('Stale', 9, 'src', '/s', datetime('now', '-25 hours'))`).run()
   expect(scheduleChecks(db, 24)).toBe(2) // series 1 (never checked) + Stale
   expect(db.prepare(`select series_id, kind from jobs order by series_id`).all()).toEqual([
     { series_id: 1, kind: 'check' },
@@ -134,7 +139,7 @@ test('a check with new chapters on the source appends them; without, it only tou
   expect((await cbzEntries(file)).filter(n => n.startsWith('0002.0/'))).toHaveLength(2)
 })
 
-test('a series whose CBZ disappeared fails instead of starting a new CBZ', async () => {
+test('a series whose volume disappeared fails instead of starting a new one', async () => {
   const chapters = [ch(10, 1)]
   const { db, file, ctx, job } = setup(chapters)
   enqueue(db, 1, 'download')
@@ -144,7 +149,7 @@ test('a series whose CBZ disappeared fails instead of starting a new CBZ', async
   enqueue(db, 1, 'check')
   await runNext(ctx)
   expect(job().state).toBe('failed')
-  expect(job().error).toContain('CBZ not found')
+  expect(job().error).toContain('not found')
   expect(existsSync(file)).toBe(false)
 })
 
@@ -198,7 +203,8 @@ test('after a source switch only chapters above the old max are downloaded', asy
 })
 
 test('a new source whose numbering is far behind fails instead of silently finding nothing', async () => {
-  const { db, file, ctx, job } = setup([ch(20, 1), ch(21, 2)])
+  const { db, dir, file, ctx, job } = setup([ch(20, 1), ch(21, 2)])
+  mkdirSync(dir)
   writeFileSync(file, '') // the CBZ exists; only the numbering is off
   db.prepare(`insert into chapters (series_id, number, suwayomi_chapter_id) values (1, 120, 1)`).run()
   db.prepare(`update series set resume_after = 120`).run()
@@ -309,4 +315,88 @@ test('an outlier chapter is stored with a warning and notified once', async () =
   expect(db.prepare(`select warning from chapters where number = 6`).get()).toEqual({ warning: '40 pages; this series usually has about 4' })
   expect(notify).toHaveBeenCalledOnce()
   expect(notify.mock.calls[0]![1]).toContain('Chapter 6: 40 pages')
+})
+
+const comicInfo = (path: string) =>
+  new Promise<string>((ok, fail) =>
+    yauzl.open(path, { lazyEntries: true }, (e, z) => {
+      if (e) return fail(e)
+      z.on('entry', (entry: yauzl.Entry) => z.openReadStream(entry, (err, s) => (err ? fail(err) : text(s).then(ok, fail))))
+      z.readEntry() // ComicInfo.xml is always the first entry
+    }),
+  )
+const volumes = (db: Ctx['db']) => db.prepare(`select number, volume from chapters order by number`).all().map(r => [(r as { number: number }).number, (r as { volume: number }).volume])
+
+test('assignVolumes fills the last volume to size, then starts the next; late chapters join their neighbours', () => {
+  expect([...assignVolumes([], [1, 2, 3, 4, 5], 2)]).toEqual([[1, 1], [2, 1], [3, 2], [4, 2], [5, 3]])
+  const have = [{ number: 1, volume: 1 }, { number: 2, volume: 1 }, { number: 3, volume: 2 }]
+  expect([...assignVolumes(have, [4, 5], 2)]).toEqual([[4, 2], [5, 3]])
+  expect([...assignVolumes(have, [2.5], 2)]).toEqual([[2.5, 1]]) // posted late: stays with chapter 2
+  expect([...assignVolumes(have, [0], 2)]).toEqual([[0, 1]]) // before everything: first volume
+})
+
+test('a first download splits into volumes, each with cover and its own ComicInfo number and range', async () => {
+  const { db, ctx, vol, rows, job } = setup([1, 2, 3, 4, 5].map(n => ch(n, n)), 2)
+  enqueue(db, 1, 'download')
+  await runNext(ctx)
+  expect(job().state).toBe('done')
+  expect(rows()).toEqual([1, 2, 3, 4, 5])
+  expect(volumes(db)).toEqual([[1, 1], [2, 1], [3, 2], [4, 2], [5, 3]])
+  expect(await cbzEntries(vol(1))).toEqual(['ComicInfo.xml', '0000-cover.jpg', '0001.0/001.jpg', '0001.0/002.jpg', '0002.0/001.jpg', '0002.0/002.jpg'])
+  expect(await cbzEntries(vol(3))).toEqual(['ComicInfo.xml', '0000-cover.jpg', '0005.0/001.jpg', '0005.0/002.jpg'])
+  const xml = await comicInfo(vol(2))
+  expect(xml).toContain('<Series>S</Series>')
+  expect(xml).toContain('<Number>2</Number>')
+  expect(xml).toContain('<Title>Vol. 2 (Ch. 3–4)</Title>')
+  expect(db.prepare(`select pages from chapters where number = 1`).get()).toEqual({ pages: 2 })
+})
+
+test('new chapters only rewrite the volumes they land in', async () => {
+  const chapters = [1, 2, 3].map(n => ch(n, n))
+  const { db, ctx, vol } = setup(chapters, 2)
+  enqueue(db, 1, 'download')
+  await runNext(ctx)
+  const vol1 = readFileSync(vol(1))
+  chapters.push(ch(4, 4), ch(5, 5))
+  enqueue(db, 1, 'check')
+  await runNext(ctx)
+  expect(readFileSync(vol(1)).equals(vol1)).toBe(true) // untouched
+  expect((await cbzEntries(vol(2))).filter(n => n.includes('/')).map(n => n.split('/')[0])).toEqual(['0003.0', '0003.0', '0004.0', '0004.0'])
+  expect(await cbzEntries(vol(3))).toContain('0000-cover.jpg') // a new volume gets the cover too
+  expect(await comicInfo(vol(2))).toContain('<Title>Vol. 2 (Ch. 3–4)</Title>')
+})
+
+test('removing a chapter rewrites only its volume', async () => {
+  const { db, ctx, vol } = setup([1, 2, 3, 4].map(n => ch(n, n)), 2)
+  enqueue(db, 1, 'download')
+  await runNext(ctx)
+  const vol2 = readFileSync(vol(2))
+  db.prepare(`update chapters set removed = 1 where number = 1`).run()
+  enqueue(db, 1, 'check')
+  await runNext(ctx)
+  expect((await cbzEntries(vol(1))).some(n => n.startsWith('0001.0/'))).toBe(false)
+  expect(readFileSync(vol(2)).equals(vol2)).toBe(true)
+})
+
+test('a rebuild re-splits by size and deletes volumes past the new last one', async () => {
+  const chapters = [1, 2, 3, 4, 5].map(n => ch(n, n))
+  const { db, ctx, vol } = setup(chapters, 2)
+  enqueue(db, 1, 'download')
+  await runNext(ctx)
+  db.prepare(`update series set volume_size = 3`).run()
+  chapters.pop()
+  enqueue(db, 1, 'rebuild')
+  await runNext(ctx)
+  expect(volumes(db)).toEqual([[1, 1], [2, 1], [3, 1], [4, 2]])
+  expect(existsSync(vol(2))).toBe(true)
+  expect(existsSync(vol(3))).toBe(false)
+})
+
+test('a series still in a single legacy CBZ is left alone until it has been split', async () => {
+  const { db, ctx, sw, job } = setup([ch(1, 1)])
+  db.prepare(`update series set legacy_file = '/lib/S.cbz'`).run()
+  enqueue(db, 1, 'check')
+  await runNext(ctx)
+  expect(sw.manga).not.toHaveBeenCalled()
+  expect(job().error).toContain('waiting to be split')
 })

@@ -3,7 +3,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 import { Hono } from 'hono'
 import * as suwayomi from './suwayomi.ts'
-import { cbzName } from './cbz.ts'
+import { safeName } from './cbz.ts'
 import { enqueue } from './worker.ts'
 
 const id = (s: string | undefined) => (s && /^\d+$/.test(s) ? Number(s) : null)
@@ -125,33 +125,33 @@ export function api(db: DatabaseSync, libraryDir: string, sw: typeof suwayomi = 
     return c.json({ queued: true }, 202)
   })
 
-  // For when the CBZ lives somewhere else, e.g. BookOrbit organised it into manhwa/<author>/<series>/.
-  // Existing file at the new path → adopt it. Otherwise move ours there.
+  // For when the volumes live somewhere else, e.g. BookOrbit organised them into manhwa/<author>/<series>/.
+  // Existing folder at the new path → adopt it. Otherwise move ours there.
   app.patch('/series/:id', async c => {
     const seriesId = id(c.req.param('id'))
-    const series = seriesId === null ? undefined : (db.prepare(`select id, file_path from series where id = ?`).get(seriesId) as { id: number; file_path: string } | undefined)
+    const series = seriesId === null ? undefined : (db.prepare(`select id, dir from series where id = ?`).get(seriesId) as { id: number; dir: string } | undefined)
     if (!series) return c.json({ error: 'not found' }, 404)
     const body = await c.req.json().catch(() => ({}))
-    if (typeof body.filePath !== 'string' || !body.filePath.trim()) return c.json({ error: 'filePath is required' }, 400)
+    if (typeof body.dir !== 'string' || !body.dir.trim()) return c.json({ error: 'dir is required' }, 400)
     // Relative paths are relative to the library; either way it has to stay inside it.
-    const next = resolve(libraryDir, body.filePath.trim())
+    const next = resolve(libraryDir, body.dir.trim())
     const rel = relative(resolve(libraryDir), next)
     if (!rel || rel.startsWith('..') || isAbsolute(rel) || rel.split(/[\\/]/).some(p => p.startsWith('.'))) {
-      return c.json({ error: `path must be inside ${libraryDir} and not in a hidden folder` }, 400)
+      return c.json({ error: `path must be a folder inside ${libraryDir} and not a hidden one` }, 400)
     }
-    if (!next.toLowerCase().endsWith('.cbz')) return c.json({ error: 'path must end in .cbz' }, 400)
-    if (next === resolve(series.file_path)) return c.json({ filePath: series.file_path })
-    if (db.prepare(`select 1 from series where file_path = ? and id != ?`).get(next, series.id)) return c.json({ error: 'another series already uses that file' }, 409)
+    if (next.toLowerCase().endsWith('.cbz')) return c.json({ error: 'point at the series folder, not a CBZ' }, 400)
+    if (next === resolve(series.dir)) return c.json({ dir: series.dir })
+    if (db.prepare(`select 1 from series where dir = ? and id != ?`).get(next, series.id)) return c.json({ error: 'another series already uses that folder' }, 409)
     if (db.prepare(`select 1 from jobs where series_id = ? and state = 'running'`).get(series.id)) return c.json({ error: 'a download is running; try again when it finishes' }, 409)
 
     let moved = false
-    if (!existsSync(next) && existsSync(series.file_path)) {
+    if (!existsSync(next) && existsSync(series.dir)) {
       mkdirSync(dirname(next), { recursive: true })
-      renameSync(series.file_path, next)
+      renameSync(series.dir, next)
       moved = true
     }
-    db.prepare(`update series set file_path = ?, last_error = null where id = ?`).run(next, series.id)
-    return c.json({ filePath: next, moved })
+    db.prepare(`update series set dir = ?, last_error = null where id = ?`).run(next, series.id)
+    return c.json({ dir: next, moved })
   })
 
   app.post('/series', async c => {
@@ -159,14 +159,14 @@ export function api(db: DatabaseSync, libraryDir: string, sw: typeof suwayomi = 
     const mangaId = typeof body.mangaId === 'number' && Number.isInteger(body.mangaId) ? body.mangaId : null
     if (mangaId === null) return c.json({ error: 'mangaId (integer) is required' }, 400)
     const { manga } = await sw.manga(mangaId)
-    const filePath = join(libraryDir, cbzName(manga.title))
-    const taken = db.prepare(`select id from series where file_path = ?`).get(filePath)
+    const dir = join(libraryDir, safeName(manga.title))
+    const taken = db.prepare(`select id from series where dir = ?`).get(dir)
     if (taken) return c.json({ error: `"${manga.title}" is already tracked` }, 409)
-    // Never adopt a CBZ we didn't create: appending would mix our chapters into someone else's file.
-    if (existsSync(filePath)) return c.json({ error: `${cbzName(manga.title)} already exists in the library` }, 409)
+    // Never adopt a folder we didn't create: our volumes would mix with someone else's files.
+    if (existsSync(dir)) return c.json({ error: `${safeName(manga.title)}/ already exists in the library` }, 409)
     const { lastInsertRowid } = db
-      .prepare(`insert into series (title, suwayomi_manga_id, source_name, cover_url, file_path) values (?, ?, ?, ?, ?)`)
-      .run(manga.title, manga.id, manga.source.displayName, manga.thumbnailUrl, filePath)
+      .prepare(`insert into series (title, suwayomi_manga_id, source_name, cover_url, dir) values (?, ?, ?, ?, ?)`)
+      .run(manga.title, manga.id, manga.source.displayName, manga.thumbnailUrl, dir)
     enqueue(db, Number(lastInsertRowid), 'download')
     return c.json({ id: Number(lastInsertRowid), title: manga.title }, 201)
   })

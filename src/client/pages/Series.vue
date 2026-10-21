@@ -41,8 +41,8 @@ async function savePath() {
   if (editingPath.value === null) return
   savingPath.value = true
   try {
-    const res = await api.patch<{ filePath: string; moved?: boolean }>(`/series/${route.params.id}`, { filePath: editingPath.value })
-    toast.success(res.moved ? 'CBZ moved' : 'Path updated')
+    const res = await api.patch<{ dir: string; moved?: boolean }>(`/series/${route.params.id}`, { dir: editingPath.value })
+    toast.success(res.moved ? 'Folder moved' : 'Path updated')
     editingPath.value = null
     await load()
   } catch (e) {
@@ -82,7 +82,7 @@ async function removeChapter() {
   removeBusy.value = true
   try {
     await api.post(`/series/${route.params.id}/chapters/${removing.value}/remove`, {})
-    toast.success(`Chapter ${removing.value} will be removed from the CBZ`)
+    toast.success(`Chapter ${removing.value} will be removed from its volume`)
     removing.value = null
     await load()
   } catch (e) {
@@ -130,21 +130,21 @@ onUnmounted(() => clearInterval(timer))
             <span :title="series.last_checked_at ? fromDb(series.last_checked_at).toLocaleString() : undefined">checked {{ ago(series.last_checked_at) }}</span>
           </div>
           <form v-if="editingPath !== null" class="flex max-w-2xl flex-col gap-2 sm:flex-row" @submit.prevent="savePath">
-            <Input v-model="editingPath" aria-label="CBZ path" class="flex-1 font-mono text-xs" autofocus @keydown.esc="editingPath = null" />
+            <Input v-model="editingPath" aria-label="Series folder" class="flex-1 font-mono text-xs" autofocus @keydown.esc="editingPath = null" />
             <div class="flex gap-2">
               <Button type="submit" size="sm" :disabled="savingPath"><Loader2 v-if="savingPath" class="animate-spin" />Save</Button>
               <Button type="button" size="sm" variant="ghost" @click="editingPath = null">Cancel</Button>
             </div>
           </form>
           <div v-else class="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
-            <span class="wrap-anywhere font-mono" :title="series.file_path">{{ series.file_path }}</span>
+            <span class="wrap-anywhere font-mono" :title="series.dir">{{ series.dir }}</span>
             <button
               type="button"
               class="shrink-0 rounded p-1 hover:bg-accent hover:text-foreground disabled:opacity-50"
-              title="Change path. If the file is already there, Mangarr uses it; otherwise it moves the CBZ."
-              aria-label="Change CBZ path"
+              title="Change path. If the folder is already there, Mangarr uses it; otherwise it moves the series folder."
+              aria-label="Change series folder"
               :disabled="!!activeJob"
-              @click="editingPath = series.file_path"
+              @click="editingPath = series.dir"
             >
               <Pencil :size="13" />
             </button>
@@ -176,7 +176,7 @@ onUnmounted(() => clearInterval(timer))
       <ConfirmDialog
         :open="confirmRebuild"
         title="Redownload all chapters?"
-        :description="`Every chapter is downloaded again from ${series.source_name} and the CBZ is rebuilt from scratch. The current file stays in place until the new one is complete. For a long series this can take a while.`"
+        :description="`Every chapter is downloaded again from ${series.source_name} and every volume is rebuilt from scratch, re-split by volume size. The current files stay in place until their replacements are complete. For a long series this can take a while.`"
         confirm-label="Redownload"
         :busy="rebuilding"
         :destructive="false"
@@ -187,7 +187,7 @@ onUnmounted(() => clearInterval(timer))
       <ConfirmDialog
         :open="removing !== null"
         :title="`Remove chapter ${removing}?`"
-        description="It's taken out of the CBZ and won't be downloaded again, not even by Redownload all, until you restore it."
+        description="It's taken out of its volume and won't be downloaded again, not even by Redownload all, until you restore it."
         confirm-label="Remove"
         :busy="removeBusy"
         @confirm="removeChapter"
@@ -234,7 +234,7 @@ onUnmounted(() => clearInterval(timer))
                   v-else
                   type="button"
                   class="rounded p-1.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-50"
-                  :title="`Remove chapter ${c.number} from the CBZ`"
+                  :title="`Remove chapter ${c.number} from its volume`"
                   :aria-label="`Remove chapter ${c.number}`"
                   :disabled="!!activeJob"
                   @click="removing = c.number"

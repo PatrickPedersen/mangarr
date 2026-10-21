@@ -9,5 +9,6 @@ Confirmed 2026-10-19.
 - **Per series:** One active source. Failed check/download → notification (Gotify) → manual source switch. Switch resumes from highest chapter in the CBZ; full redownload as a manual option.
 - **UI:** BookOrbit look & feel — library grid, search/add, series page (chapters, switch source, check now), activity/failures view.
 - **Success:** Add a series once, new chapters appear in BookOrbit; only intervene when a source dies.
-- **Out of scope:** In-app reader, user accounts, auto-switching/merging sources, per-chapter/per-volume CBZs, BookOrbit code integration.
+- **Out of scope:** In-app reader, user accounts, auto-switching/merging sources, per-chapter CBZs, BookOrbit code integration.
+- **Changed 2026-10-21:** one CBZ per series became one folder of volume CBZs per series (default 25 chapters/volume, boundaries editable), because BookOrbit's reader can't navigate chapters in an 18k-page book.
 - **Risk to test first:** Does BookOrbit keep reading progress when a CBZ is rewritten with appended chapters?
