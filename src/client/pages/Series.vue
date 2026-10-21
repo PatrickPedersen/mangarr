@@ -9,6 +9,7 @@ import { Input } from '@/components/ui/input'
 import ConfirmDialog from '@/components/ui/ConfirmDialog.vue'
 import SourceSwitcher from '@/components/SourceSwitcher.vue'
 import VolumeEditor from '@/components/VolumeEditor.vue'
+import { firstChapter, lastChapter } from '../../server/chapterOrder'
 import { ago, api, fromDb, type Chapter, type SeriesDetail } from '@/lib/api'
 
 const route = useRoute()
@@ -117,8 +118,8 @@ const volumes = computed(() => {
       return {
         volume,
         chapters,
-        first: Math.min(...numbers),
-        last: Math.max(...numbers),
+        first: numbers.length ? firstChapter(numbers) : NaN,
+        last: numbers.length ? lastChapter(numbers) : NaN,
         count: kept.length,
         pages: kept.reduce((n, c) => n + (c.pages ?? 0), 0),
       }

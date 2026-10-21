@@ -6,6 +6,7 @@ import { text } from 'node:stream/consumers'
 import { cbzEntries, pageName, writeCbz, type AddFile } from '../src/server/cbz.ts'
 import { expect, test, vi } from 'vitest'
 import { openDb } from '../src/server/db.ts'
+import { compareChapters } from '../src/server/chapterOrder.ts'
 import { assignVolumes, enqueue, missingChapters, pageCountWarnings, runNext, scheduleChecks, type Ctx } from '../src/server/worker.ts'
 import type { Chapter } from '../src/server/suwayomi.ts'
 
@@ -522,4 +523,20 @@ test.each([
   expect(await chaptersIn(vol(1))).toEqual([1, 2])
   expect(await chaptersIn(vol(2))).toEqual([3, 4])
   expect(readdirSync(dir).sort()).toEqual(['S Vol. 1', 'S Vol. 2']) // old files and folders gone
+})
+
+test('sub-chapters order as readers number them: 175.2 < 175.9 < 175.11, all between 175 and 176', () => {
+  const tbate = [176, 175.9, 175.11, 175, 175.2, 175.16, 175.1, 174]
+  expect([...tbate].sort(compareChapters)).toEqual([174, 175, 175.1, 175.2, 175.9, 175.11, 175.16, 176])
+  expect([38.5, 38.1, 38, 39].sort(compareChapters)).toEqual([38, 38.1, 38.5, 39])
+  expect(missingChapters([ch(1, 175.11), ch(2, 175.2), ch(3, 175)], new Set()).map(c => c.chapterNumber)).toEqual([175, 175.2, 175.11])
+})
+
+test('volumes follow sub-chapter order: a boundary never lands inside 175.2…175.11', async () => {
+  const { db, ctx, vol } = setup([175, 175.1, 175.11, 175.2, 175.9, 176].map((n, i) => ch(i + 1, n, i)), 3)
+  enqueue(db, 1, 'download')
+  await runNext(ctx)
+  expect(await chaptersIn(vol(1))).toEqual([175, 175.1, 175.2])
+  expect(await chaptersIn(vol(2))).toEqual([175.9, 175.11, 176].sort((a, b) => (String(a) < String(b) ? -1 : 1))) // zip order is by name
+  expect(await comicInfo(vol(2))).toContain('<Title>Vol. 2 (Ch. 175.9–176)</Title>')
 })

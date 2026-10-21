@@ -5,6 +5,7 @@ import { Hono } from 'hono'
 import * as suwayomi from './suwayomi.ts'
 import { safeName } from './cbz.ts'
 import { enqueue } from './worker.ts'
+import { compareChapters, lastChapter } from './chapterOrder.ts'
 
 const id = (s: string | undefined) => (s && /^\d+$/.test(s) ? Number(s) : null)
 
@@ -59,7 +60,8 @@ export function api(db: DatabaseSync, libraryDir: string, sw: typeof suwayomi = 
     const seriesId = id(c.req.param('id'))
     const series = seriesId === null ? undefined : db.prepare(`select * from series where id = ?`).get(seriesId)
     if (!series) return c.json({ error: 'not found' }, 404)
-    const chapters = db.prepare(`select number, title, downloaded_at, removed, warning, volume, pages from chapters where series_id = ? order by number desc`).all(seriesId)
+    const chapters = (db.prepare(`select number, title, downloaded_at, removed, warning, volume, pages from chapters where series_id = ?`).all(seriesId) as { number: number }[])
+      .sort((a, b) => compareChapters(b.number, a.number))
     const jobs = db.prepare(`select id, kind, state, error, created_at, finished_at from jobs where series_id = ? order by id desc limit 10`).all(seriesId)
     return c.json({ ...series, chapters, jobs })
   })
@@ -83,10 +85,9 @@ export function api(db: DatabaseSync, libraryDir: string, sw: typeof suwayomi = 
     if (mangaId === series.suwayomi_manga_id) return c.json({ error: 'that is already the current source' }, 400)
     if (db.prepare(`select 1 from jobs where series_id = ? and state = 'running'`).get(series.id)) return c.json({ error: 'a download is running; try again when it finishes' }, 409)
     const { manga } = await sw.manga(mangaId)
-    db.prepare(
-      `update series set suwayomi_manga_id = ?, source_name = ?, cover_url = ?, last_error = null,
-         resume_after = (select max(number) from chapters where series_id = ?) where id = ?`,
-    ).run(manga.id, manga.source.displayName, manga.thumbnailUrl, series.id, series.id)
+    const numbers = (db.prepare(`select number from chapters where series_id = ?`).all(series.id) as { number: number }[]).map(r => r.number)
+    db.prepare(`update series set suwayomi_manga_id = ?, source_name = ?, cover_url = ?, last_error = null, resume_after = ? where id = ?`)
+      .run(manga.id, manga.source.displayName, manga.thumbnailUrl, numbers.length ? lastChapter(numbers) : null, series.id)
     enqueue(db, series.id, 'check')
     return c.json({ sourceName: manga.source.displayName })
   })
@@ -110,7 +111,7 @@ export function api(db: DatabaseSync, libraryDir: string, sw: typeof suwayomi = 
     const series = db.prepare(`select resume_after from series where id = ?`).get(seriesId) as { resume_after: number | null } | undefined
     if (!series) return c.json({ error: 'not found' }, 404)
     // Below the switch point the current source isn't asked for old chapters, so deleting the row wouldn't bring it back.
-    if (series.resume_after !== null && number <= series.resume_after) {
+    if (series.resume_after !== null && compareChapters(number, series.resume_after) <= 0) {
       return c.json({ error: 'this chapter is from before the source switch; Redownload all brings it back' }, 409)
     }
     const res = db.prepare(`delete from chapters where series_id = ? and number = ? and removed = 1`).run(seriesId, number)
@@ -133,7 +134,9 @@ export function api(db: DatabaseSync, libraryDir: string, sw: typeof suwayomi = 
     if (validStarts === validSize) return c.json({ error: 'send either starts (array of chapter numbers) or size (integer 1–1000)' }, 400)
     if (db.prepare(`select 1 from jobs where series_id = ? and state = 'running'`).get(seriesId)) return c.json({ error: 'a download is running; try again when it finishes' }, 409)
 
-    const numbers = (db.prepare(`select number from chapters where series_id = ? and removed = 0 order by number`).all(seriesId) as { number: number }[]).map(r => r.number)
+    const numbers = (db.prepare(`select number from chapters where series_id = ? and removed = 0`).all(seriesId) as { number: number }[])
+      .map(r => r.number)
+      .sort(compareChapters)
     let volumeOf: (n: number, i: number) => number
     if (validStarts) {
       const have = new Set(numbers)

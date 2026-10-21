@@ -4,6 +4,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import type { DatabaseSync } from 'node:sqlite'
 import * as suwayomi from './suwayomi.ts'
 import type { Notify } from './notify.ts'
+import { compareChapters, firstChapter, lastChapter } from './chapterOrder.ts'
 import { buildCbz, cbzEntries, chapterDir, cleanTmp, pageName, safeName, volumeName, writeCbz, type AddFile } from './cbz.ts'
 
 export type Ctx = { db: DatabaseSync; sw: Pick<typeof suwayomi, 'manga' | 'pages' | 'image'>; libraryDir: string; notify: Notify }
@@ -33,7 +34,7 @@ export function missingChapters(remote: suwayomi.Chapter[], have: Set<number>) {
     if (c.chapterNumber < 0 || have.has(c.chapterNumber) || byNumber.has(c.chapterNumber)) continue
     byNumber.set(c.chapterNumber, c)
   }
-  return [...byNumber.values()].sort((a, b) => a.chapterNumber - b.chapterNumber)
+  return [...byNumber.values()].sort((a, b) => compareChapters(a.chapterNumber, b.chapterNumber))
 }
 
 /** Page counts far from the series' usual (over 3x or under 1/3 of the median) are worth a human look. */
@@ -55,14 +56,14 @@ export function pageCountWarnings(baseline: number[], fresh: Map<number, number>
  * volume of the chapter just before it.
  */
 export function assignVolumes(have: { number: number; volume: number }[], add: number[], size: number) {
-  const sorted = [...have].sort((a, b) => a.number - b.number)
-  const max = sorted.at(-1)?.number ?? -Infinity
+  const sorted = [...have].sort((a, b) => compareChapters(a.number, b.number))
+  const max = sorted.at(-1)?.number
   let last = Math.max(1, ...have.map(h => h.volume))
   let count = have.filter(h => h.volume === last).length
   const out = new Map<number, number>()
   for (const n of add) {
-    if (n < max) {
-      out.set(n, (sorted.findLast(h => h.number < n) ?? sorted[0]!).volume)
+    if (max !== undefined && compareChapters(n, max) < 0) {
+      out.set(n, (sorted.findLast(h => compareChapters(h.number, n) < 0) ?? sorted[0]!).volume)
       continue
     }
     if (count >= size) [last, count] = [last + 1, 0]
@@ -73,7 +74,7 @@ export function assignVolumes(have: { number: number; volume: number }[], add: n
 }
 
 const range = (nums: number[]) => {
-  const [lo, hi] = [Math.min(...nums), Math.max(...nums)]
+  const [lo, hi] = [firstChapter(nums), lastChapter(nums)]
   return lo === hi ? `Ch. ${lo}` : `Ch. ${lo}–${hi}`
 }
 
@@ -101,11 +102,11 @@ async function download({ db, sw, libraryDir, notify }: Ctx, series: Series, fre
   let todo = missingChapters(chapters, have)
   // After a source switch, only take chapters past what the old source gave us: numbering often differs between sites.
   if (!fresh && series.resume_after !== null) {
-    const latest = Math.max(...chapters.map(c => c.chapterNumber))
-    if (latest < series.resume_after) {
+    const latest = lastChapter(chapters.map(c => c.chapterNumber))
+    if (compareChapters(latest, series.resume_after) < 0) {
       throw new Error(`this source's latest chapter (${latest}) is below what we already have (${series.resume_after}); its numbering differs. Use Redownload all.`)
     }
-    todo = todo.filter(c => c.chapterNumber > series.resume_after!)
+    todo = todo.filter(c => compareChapters(c.chapterNumber, series.resume_after!) > 0)
   }
   if ((fresh || kept.length === 0) && todo.length === 0) throw new Error('source returned no downloadable chapters')
 
@@ -239,7 +240,8 @@ const removeVolume = (series: Series, file: string) => {
  * deleted only after that.
  */
 async function restructure({ db, sw }: Ctx, series: Series) {
-  const rows = db.prepare(`select number, volume from chapters where series_id = ? and removed = 0 order by number`).all(series.id) as { number: number; volume: number | null }[]
+  const rows = (db.prepare(`select number, volume from chapters where series_id = ? and removed = 0`).all(series.id) as { number: number; volume: number | null }[])
+    .sort((a, b) => compareChapters(a.number, b.number))
   // Chapters from a legacy CBZ have no volume yet: split them by size.
   if (rows.some(r => r.volume === null)) {
     const vol = assignVolumes([], rows.map(r => r.number), series.volume_size)

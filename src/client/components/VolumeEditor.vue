@@ -4,12 +4,13 @@ import { ChevronDown, ChevronUp, Loader2, Scissors, SplitSquareVertical, X } fro
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { Chapter } from '@/lib/api'
+import { compareChapters } from '../../server/chapterOrder'
 
 const props = defineProps<{ chapters: Chapter[]; volumeSize: number; busy: boolean }>()
 const emit = defineEmits<{ save: [starts: number[], size: number]; cancel: [] }>()
 
 // Downloaded chapters in reading order; the draft is the index where each volume starts (first is always 0).
-const list = computed(() => props.chapters.filter(c => !c.removed).sort((a, b) => a.number - b.number))
+const list = computed(() => props.chapters.filter(c => !c.removed).sort((a, b) => compareChapters(a.number, b.number)))
 const initial = () => list.value.flatMap((c, i) => (i === 0 || c.volume !== list.value[i - 1]!.volume ? [i] : []))
 const draft = ref(initial())
 const size = ref(props.volumeSize)
