@@ -2,12 +2,13 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { toast } from 'vue-sonner'
-import { AlertCircle, AlertTriangle, ArrowLeft, ArrowRightLeft, Download, ImageOff, Loader2, Merge, Pencil, RefreshCw, Scissors, Trash2, Undo2 } from '@lucide/vue'
+import { AlertCircle, AlertTriangle, ArrowLeft, ArrowRightLeft, Download, ImageOff, Layers, Loader2, Pencil, RefreshCw, Trash2, Undo2 } from '@lucide/vue'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import ConfirmDialog from '@/components/ui/ConfirmDialog.vue'
 import SourceSwitcher from '@/components/SourceSwitcher.vue'
+import VolumeEditor from '@/components/VolumeEditor.vue'
 import { ago, api, fromDb, type Chapter, type SeriesDetail } from '@/lib/api'
 
 const route = useRoute()
@@ -16,12 +17,9 @@ const error = ref('')
 const coverBroken = ref(false)
 const activeJob = computed(() => series.value?.jobs.find(j => j.state === 'queued' || j.state === 'running'))
 
-const sizeInput = ref(25)
 async function load() {
   try {
-    const first = !series.value
     series.value = await api.get<SeriesDetail>(`/series/${route.params.id}`)
-    if (first) sizeInput.value = series.value.volume_size
     error.value = ''
   } catch (e) {
     error.value = (e as Error).message
@@ -129,24 +127,21 @@ const volumes = computed(() => {
 const starts = computed(() => volumes.value.filter(g => g.volume > 0 && g.count).map(g => g.first))
 const pending = computed(() => activeJob.value?.kind === 'restructure' || volumes.value.some(g => g.volume === 0 && g.count))
 
-async function setVolumes(body: unknown, message: string) {
+const editingVolumes = ref(false)
+const savingVolumes = ref(false)
+async function saveVolumes(next: number[], size: number) {
+  savingVolumes.value = true
   try {
-    await api.put(`/series/${route.params.id}/volumes`, body)
-    toast.success(message)
+    if (size !== series.value!.volume_size) await api.put(`/series/${route.params.id}/volumes`, { size })
+    if (next.join() !== starts.value.slice(1).join()) await api.put(`/series/${route.params.id}/volumes`, { starts: next })
+    toast.success('Volumes saved; changed volumes are being rewritten')
+    editingVolumes.value = false
     await load()
   } catch (e) {
     toast.error((e as Error).message)
+  } finally {
+    savingVolumes.value = false
   }
-}
-const startVolumeAt = (n: number) => setVolumes({ starts: [...starts.value, n] }, `A new volume starts at chapter ${n}`)
-const mergeIntoPrevious = (g: { volume: number; first: number }) =>
-  setVolumes({ starts: starts.value.filter(s => s !== g.first) }, `Vol. ${g.volume} merged into Vol. ${g.volume - 1}`)
-const sizeValid = computed(() => Number.isInteger(sizeInput.value) && sizeInput.value >= 1 && sizeInput.value <= 1000)
-const saveSize = () => setVolumes({ size: sizeInput.value }, `New volumes get ${sizeInput.value} chapters`)
-const confirmResplit = ref(false)
-async function resplit() {
-  await setVolumes({ size: sizeInput.value, resplit: true }, `Re-splitting into volumes of ${sizeInput.value}`)
-  confirmResplit.value = false
 }
 const chRange = (g: { first: number; last: number }) => (g.first === g.last ? `Ch. ${g.first}` : `Ch. ${g.first}–${g.last}`)
 
@@ -234,16 +229,6 @@ onUnmounted(() => clearInterval(timer))
       />
 
       <ConfirmDialog
-        :open="confirmResplit"
-        :title="`Re-split into volumes of ${sizeInput} chapters?`"
-        description="Every volume is rewritten from the pages already downloaded, replacing any boundaries you set by hand. Volumes are swapped in only once complete, but your place in a book that changes shifts in BookOrbit."
-        confirm-label="Re-split"
-        :destructive="false"
-        @confirm="resplit"
-        @cancel="confirmResplit = false"
-      />
-
-      <ConfirmDialog
         :open="removing !== null"
         :title="`Remove chapter ${removing}?`"
         description="It's taken out of its volume and won't be downloaded again, not even by Redownload all, until you restore it."
@@ -253,15 +238,20 @@ onUnmounted(() => clearInterval(timer))
         @cancel="removing = null"
       />
 
-      <form class="flex flex-wrap items-center gap-2 text-sm" @submit.prevent="saveSize">
-        <label for="volume-size" class="text-muted-foreground">Chapters per volume</label>
-        <Input id="volume-size" v-model.number="sizeInput" type="number" min="1" max="1000" class="h-8 w-20 tabular-nums" />
-        <Button type="submit" size="sm" variant="outline" :disabled="!sizeValid || sizeInput === series.volume_size" title="Applies to volumes started from now on">Save</Button>
-        <Button type="button" size="sm" variant="outline" :disabled="!sizeValid || !!activeJob || !series.chapters.length" @click="confirmResplit = true">
-          <Scissors /> Re-split all
+      <VolumeEditor
+        v-if="editingVolumes"
+        :chapters="series.chapters"
+        :volume-size="series.volume_size"
+        :busy="savingVolumes"
+        @save="saveVolumes"
+        @cancel="editingVolumes = false"
+      />
+      <div v-else class="flex flex-wrap items-center gap-2 text-sm">
+        <Button size="sm" variant="outline" :disabled="!!activeJob || pending || !series.chapters.some(c => !c.removed)" @click="editingVolumes = true">
+          <Layers /> Edit volumes
         </Button>
         <span v-if="pending" class="flex items-center gap-1.5 text-xs text-muted-foreground"><Loader2 :size="13" class="animate-spin" /> Volume files are being updated</span>
-      </form>
+      </div>
 
       <div class="overflow-hidden rounded-xl border border-border bg-card">
         <table class="w-full text-sm">
@@ -282,19 +272,7 @@ onUnmounted(() => clearInterval(timer))
                 </template>
                 <template v-else>Not split into volumes yet</template>
               </th>
-              <td class="px-2 py-1.5 text-right">
-                <button
-                  v-if="g.volume > 1 && g.count"
-                  type="button"
-                  class="rounded p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
-                  :title="`Merge Vol. ${g.volume} into Vol. ${g.volume - 1}`"
-                  :aria-label="`Merge volume ${g.volume} into the previous one`"
-                  :disabled="!!activeJob"
-                  @click="mergeIntoPrevious(g)"
-                >
-                  <Merge :size="15" />
-                </button>
-              </td>
+              <td></td>
             </tr>
             <tr
               v-for="c in g.chapters"
@@ -312,17 +290,6 @@ onUnmounted(() => clearInterval(timer))
               </td>
               <td class="px-4 py-2 whitespace-nowrap text-muted-foreground" :title="fromDb(c.downloaded_at).toLocaleString()">{{ ago(c.downloaded_at) }}</td>
               <td class="px-2 py-1.5 text-right whitespace-nowrap">
-                <button
-                  v-if="!c.removed && g.volume && c.number !== g.first"
-                  type="button"
-                  class="rounded p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
-                  :title="`Start a new volume at chapter ${c.number}`"
-                  :aria-label="`Start a new volume at chapter ${c.number}`"
-                  :disabled="!!activeJob"
-                  @click="startVolumeAt(c.number)"
-                >
-                  <Scissors :size="15" />
-                </button>
                 <button
                   v-if="c.removed"
                   type="button"
