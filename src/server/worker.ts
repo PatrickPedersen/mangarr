@@ -5,7 +5,7 @@ import type { DatabaseSync } from 'node:sqlite'
 import * as suwayomi from './suwayomi.ts'
 import type { Notify } from './notify.ts'
 import { compareChapters, firstChapter, lastChapter } from './chapterOrder.ts'
-import { buildCbz, cbzEntries, chapterDir, cleanTmp, pageName, safeName, volumeName, writeCbz, type AddFile } from './cbz.ts'
+import { buildCbz, cbzEntries, chapterDir, cleanTmp, comicInfoTitle, pageName, safeName, volumeName, writeCbz, type AddFile } from './cbz.ts'
 
 export type Ctx = { db: DatabaseSync; sw: Pick<typeof suwayomi, 'manga' | 'pages' | 'image'>; libraryDir: string; notify: Notify }
 type Series = {
@@ -73,6 +73,8 @@ export function assignVolumes(have: { number: number; volume: number }[], add: n
   return out
 }
 
+// BookOrbit shows ComicInfo <Title> as the book's name, so it carries the series title too.
+const volumeTitle = (series: { title: string }, v: number, nums: number[]) => `${series.title} Vol. ${v} (${range(nums)})`
 const range = (nums: number[]) => {
   const [lo, hi] = [firstChapter(nums), lastChapter(nums)]
   return lo === hi ? `Ch. ${lo}` : `Ch. ${lo}–${hi}`
@@ -170,7 +172,7 @@ async function download({ db, sw, libraryDir, notify }: Ctx, series: Series, fre
   const info = { series: series.title, summary: manga.description, writer: manga.author, genre: manga.genre, web: manga.realUrl }
   for (const v of [...targets].sort((a, b) => a - b)) {
     mkdirSync(dirname(path(v)), { recursive: true })
-    const title = `Vol. ${v} (${range(after.filter(c => c.volume === v).map(c => c.number))})`
+    const title = volumeTitle(series, v, after.filter(c => c.volume === v).map(c => c.number))
     await writeCbz(path(v), add.get(v) ?? [], { ...info, number: v, title }, { fresh, drop })
   }
   if (fresh) {
@@ -271,8 +273,14 @@ async function restructure({ db, sw }: Ctx, series: Series) {
 
   const want = new Map<number, string[]>()
   for (const r of rows) want.set(r.volume!, [...(want.get(r.volume!) ?? []), chapterDir(r.number)])
-  const unchanged = (file: string, dirs: string[]) => content.get(file)?.size === dirs.length && dirs.every(d => content.get(file)!.has(d))
-  const rewrite = [...want].filter(([v, dirs]) => !unchanged(volumeFile(series, v), dirs))
+  const titleOf = (v: number) => volumeTitle(series, v, rows.filter(r => r.volume === v).map(r => r.number))
+  const unchanged = async (v: number, dirs: string[]) => {
+    const file = volumeFile(series, v)
+    const has = content.get(file)
+    return has?.size === dirs.length && dirs.every(d => has.has(d)) && (await comicInfoTitle(file)) === titleOf(v)
+  }
+  const rewrite: [number, string[]][] = []
+  for (const [v, dirs] of want) if (!(await unchanged(v, dirs))) rewrite.push([v, dirs])
 
   // Metadata is nice to have; a source that's down must not block a restructure.
   const meta = await sw.manga(series.suwayomi_manga_id).then(
@@ -287,9 +295,8 @@ async function restructure({ db, sw }: Ctx, series: Series) {
       const mine = new Set(dirs)
       const from = [...new Set(dirs.map(d => where.get(d)!))]
       readsFrom.set(target, new Set(from))
-      const numbers = rows.filter(r => r.volume === v).map(r => r.number)
       mkdirSync(dirname(target), { recursive: true })
-      const info = { series: series.title, ...meta, number: v, title: `Vol. ${v} (${range(numbers)})` }
+      const info = { series: series.title, ...meta, number: v, title: titleOf(v) }
       built.set(target, await buildCbz(target, [], info, { fresh: true, from: from.map(path => ({ path, keep: (d: string) => mine.has(d) })) }))
     }
     const pending = new Set(built.keys())

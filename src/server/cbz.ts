@@ -2,6 +2,7 @@ import { createReadStream, createWriteStream, existsSync, mkdirSync, renameSync,
 import { basename, dirname, join } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import type { Readable } from 'node:stream'
+import { text } from 'node:stream/consumers'
 import yauzl from 'yauzl'
 import yazl from 'yazl'
 
@@ -130,6 +131,20 @@ export function cleanTmp(target: string) {
   rmSync(join(tmpDir, basename(target)), { force: true })
   // Don't leave empty dot-dirs inside folders BookOrbit organises; fails harmlessly while other temp files remain.
   try { rmdirSync(tmpDir) } catch {}
+}
+
+/** The <Title> in a CBZ's ComicInfo.xml, or null. */
+export async function comicInfoTitle(path: string) {
+  const zip = await openZip(path)
+  try {
+    const entry = (await listEntries(zip)).find(e => e.fileName === 'ComicInfo.xml')
+    if (!entry) return null
+    const xml = await new Promise<string>((ok, fail) => zip.openReadStream(entry, (e, s) => (e ? fail(e) : text(s).then(ok, fail))))
+    const title = xml.match(/<Title>(.*?)<\/Title>/s)?.[1]
+    return title === undefined ? null : title.replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+  } finally {
+    zip.close()
+  }
 }
 
 /** Entry names currently in a CBZ (used to verify and in tests). */

@@ -348,7 +348,7 @@ test('a first download splits into volumes, each with cover and its own ComicInf
   const xml = await comicInfo(vol(2))
   expect(xml).toContain('<Series>S</Series>')
   expect(xml).toContain('<Number>2</Number>')
-  expect(xml).toContain('<Title>Vol. 2 (Ch. 3–4)</Title>')
+  expect(xml).toContain('<Title>S Vol. 2 (Ch. 3–4)</Title>')
   expect(db.prepare(`select pages from chapters where number = 1`).get()).toEqual({ pages: 2 })
 })
 
@@ -364,7 +364,7 @@ test('new chapters only rewrite the volumes they land in', async () => {
   expect(readFileSync(vol(1)).equals(vol1)).toBe(true) // untouched
   expect((await cbzEntries(vol(2))).filter(n => n.includes('/')).map(n => n.split('/')[0])).toEqual(['0003.0', '0003.0', '0004.0', '0004.0'])
   expect(await cbzEntries(vol(3))).toContain('0000-cover.jpg') // a new volume gets the cover too
-  expect(await comicInfo(vol(2))).toContain('<Title>Vol. 2 (Ch. 3–4)</Title>')
+  expect(await comicInfo(vol(2))).toContain('<Title>S Vol. 2 (Ch. 3–4)</Title>')
 })
 
 test('removing a chapter rewrites only its volume', async () => {
@@ -422,7 +422,7 @@ test('a v0.1 single CBZ is split into volumes without downloading, then deleted'
   expect(await chaptersIn(vol(1))).toEqual([1, 2])
   expect(await chaptersIn(vol(3))).toEqual([5])
   expect(await cbzEntries(vol(2))).toContain('0000-cover.jpg')
-  expect(await comicInfo(vol(2))).toContain('<Title>Vol. 2 (Ch. 3–4)</Title>')
+  expect(await comicInfo(vol(2))).toContain('<Title>S Vol. 2 (Ch. 3–4)</Title>')
   expect(existsSync(legacy)).toBe(false)
   expect(existsSync(join(dir, '.mangarr-tmp'))).toBe(false)
   expect(volumes(db)).toEqual([[1, 1], [2, 1], [3, 2], [4, 2], [5, 3]])
@@ -454,7 +454,7 @@ test('moving a boundary moves chapters between volumes; merging deletes the empt
   await runNext(ctx)
   expect(await chaptersIn(vol(1))).toEqual([1])
   expect(await chaptersIn(vol(2))).toEqual([2, 3, 4])
-  expect(await comicInfo(vol(2))).toContain('<Title>Vol. 2 (Ch. 2–4)</Title>')
+  expect(await comicInfo(vol(2))).toContain('<Title>S Vol. 2 (Ch. 2–4)</Title>')
   expect(await cbzEntries(vol(1))).toContain('0000-cover.jpg')
 
   db.prepare(`update chapters set volume = 1`).run() // merge everything into Vol. 1
@@ -538,5 +538,20 @@ test('volumes follow sub-chapter order: a boundary never lands inside 175.2…17
   await runNext(ctx)
   expect(await chaptersIn(vol(1))).toEqual([175, 175.1, 175.2])
   expect(await chaptersIn(vol(2))).toEqual([175.9, 175.11, 176].sort((a, b) => (String(a) < String(b) ? -1 : 1))) // zip order is by name
-  expect(await comicInfo(vol(2))).toContain('<Title>Vol. 2 (Ch. 175.9–176)</Title>')
+  expect(await comicInfo(vol(2))).toContain('<Title>S Vol. 2 (Ch. 175.9–176)</Title>')
+})
+
+test('a volume whose ComicInfo title is out of date is rewritten; an up-to-date one is left alone', async () => {
+  const { db, ctx, vol } = setup([1, 2, 3].map(n => ch(n, n)), 2)
+  enqueue(db, 1, 'download')
+  await runNext(ctx)
+  expect(await comicInfo(vol(1))).toContain('<Title>S Vol. 1 (Ch. 1–2)</Title>')
+  await writeCbz(vol(1), [], { series: 'S', number: 1, title: 'Vol. 1 (Ch. 1–2)' }) // as v0.2.0–0.2.4 wrote it
+  const vol2 = readFileSync(vol(2))
+  db.prepare(`update series set volumes_dirty = 1`).run()
+  enqueue(db, 1, 'restructure')
+  await runNext(ctx)
+  expect(await comicInfo(vol(1))).toContain('<Title>S Vol. 1 (Ch. 1–2)</Title>')
+  expect(await chaptersIn(vol(1))).toEqual([1, 2])
+  expect(readFileSync(vol(2)).equals(vol2)).toBe(true)
 })

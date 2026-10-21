@@ -47,3 +47,16 @@ test('a v0.1 database (one CBZ per series) migrates to folders, keeping chapters
   db.close()
   expect(() => openDb(path)).not.toThrow() // second open is a no-op
 })
+
+test('upgrading to user_version 1 queues every split series for a title refresh, once', () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'mangarr-db-')), 'm.db')
+  const db = openDb(path)
+  db.prepare(`insert into series (title, suwayomi_manga_id, source_name, dir) values ('A', 1, 'src', '/a')`).run()
+  db.exec('pragma user_version = 0')
+  db.close()
+  const again = openDb(path)
+  expect(again.prepare(`select volumes_dirty from series`).get()).toEqual({ volumes_dirty: 1 })
+  again.prepare(`update series set volumes_dirty = 0`).run()
+  again.close()
+  expect(openDb(path).prepare(`select volumes_dirty from series`).get()).toEqual({ volumes_dirty: 0 })
+})

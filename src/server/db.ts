@@ -62,6 +62,10 @@ export function openDb(path: string) {
     db.exec(schema.slice(schema.indexOf('create table if not exists jobs')).replace('jobs (', 'jobs_v2 ('))
     db.exec(`insert into jobs_v2 select id, series_id, kind, state, error, created_at, finished_at from jobs; drop table jobs; alter table jobs_v2 rename to jobs; commit`)
   }
+  // One-off data upgrades, numbered by user_version.
+  const version = (db.prepare('pragma user_version').get() as { user_version: number }).user_version
+  // 1: volume titles gained the series title; a restructure rewrites any volume whose title differs.
+  if (version < 1) db.exec(`update series set volumes_dirty = 1 where legacy_file is null; pragma user_version = 1`)
   return db
 }
 
